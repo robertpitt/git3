@@ -5,6 +5,12 @@ on:
     branches: [main]
 permissions:
   contents: read
+
+env:
+  GOTOOLCHAIN: local
+  STATICCHECK_VERSION: v0.8.1
+  GOVULNCHECK_VERSION: v1.7.0
+
 jobs:
   test:
     strategy:
@@ -18,8 +24,14 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
-      - run: go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck ./...
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}
+          staticcheck ./...
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+          govulncheck ./...
       - run: sh -n install.sh
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y shellcheck && shellcheck install.sh
