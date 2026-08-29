@@ -6,17 +6,39 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+
+env:
+  GOTOOLCHAIN: local
+  STATICCHECK_VERSION: v0.8.1
+  GOVULNCHECK_VERSION: v1.7.0
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: {fetch-depth: 0}
-      - uses: actions/setup-go@v5
+      - name: Verify signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag_type=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type')
+          if [[ "${tag_type}" != "tag" ]]; then
+            echo "::error::${GITHUB_REF_NAME} must be an annotated, signed tag"
+            exit 1
+          fi
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.sha')
+          verified=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.verification.verified')
+          reason=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.verification.reason')
+          if [[ "${verified}" != "true" ]]; then
+            echo "::error::${GITHUB_REF_NAME} signature is not verified (${reason})"
+            exit 1
+          fi
+      - uses: actions/setup-go@v6
         with: {go-version-file: go.mod, cache: true}
-      - run: git verify-tag "$GITHUB_REF_NAME" && test -z "$(gofmt -l .)" && go test -race ./... && go vet ./...
-      - run: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1 && staticcheck ./...
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+      - run: test -z "$(gofmt -l .)" && go test -race ./... && go vet ./...
+      - run: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && staticcheck ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} && govulncheck ./...
   build:
     needs: test
     strategy:
@@ -25,8 +47,8 @@ jobs:
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with: {go-version-file: go.mod, cache: true}
       - name: Build deterministic archive
         env:
@@ -50,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with: {pattern: 'git3-*', merge-multiple: true}
       - run: sha256sum git3_*.tar.gz | sort -k2 > checksums.txt
