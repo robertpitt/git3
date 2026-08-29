@@ -18,11 +18,38 @@ type Git struct{ Dir string }
 
 func (g Git) cmd(ctx context.Context, args ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, "git", args...)
+	environment := os.Environ()
 	if g.Dir != "" {
 		c.Dir = g.Dir
+		environment = withoutRepositoryEnvironment(environment)
 	}
-	c.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	c.Env = append(environment, "GIT_OPTIONAL_LOCKS=0")
 	return c
+}
+
+func withoutRepositoryEnvironment(environment []string) []string {
+	// Git sets GIT_DIR for remote helpers. Those inherited paths are usually
+	// relative to the caller's worktree and must not override an explicit Dir.
+	repositoryVariables := map[string]bool{
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+		"GIT_COMMON_DIR":                   true,
+		"GIT_DIR":                          true,
+		"GIT_GRAFT_FILE":                   true,
+		"GIT_INDEX_FILE":                   true,
+		"GIT_OBJECT_DIRECTORY":             true,
+		"GIT_PREFIX":                       true,
+		"GIT_REPLACE_REF_BASE":             true,
+		"GIT_SHALLOW_FILE":                 true,
+		"GIT_WORK_TREE":                    true,
+	}
+	filtered := make([]string, 0, len(environment))
+	for _, variable := range environment {
+		name, _, _ := strings.Cut(variable, "=")
+		if !repositoryVariables[name] {
+			filtered = append(filtered, variable)
+		}
+	}
+	return filtered
 }
 
 // Run executes Git with args and returns its standard output.
