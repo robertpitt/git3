@@ -10,7 +10,7 @@
 git3 is a Git remote helper that stores a complete, ordinary Git repository in an S3 bucket you
 control. It works with Amazon S3 and S3-compatible object storage.
 
-![Git exchanging objects directly with an S3-compatible bucket](assets/git3-s3-flow.png)
+![Local Git pushing and fetching native objects through git3 directly to S3-compatible storage](assets/git3-s3-flow-v2.png)
 
 ## Install in one line
 
