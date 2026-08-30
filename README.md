@@ -1,7 +1,5 @@
 # git3
 
-**Put a Git remote in S3. No server to run.**
-
 <p align="center">
   <a href="https://robertpitt.github.io/git3/">Website</a> ·
   <a href="https://github.com/robertpitt/git3/releases">Releases</a> ·
