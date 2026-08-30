@@ -18,6 +18,7 @@ type terminalProgress struct {
 	started  time.Time
 	last     time.Time
 	lineOpen bool
+	native   bool
 }
 
 func (p *terminalProgress) Write(b []byte) (int, error) {
@@ -26,7 +27,7 @@ func (p *terminalProgress) Write(b []byte) (int, error) {
 	if p.out == nil {
 		return len(b), nil
 	}
-	if p.lineOpen {
+	if p.lineOpen && !p.native {
 		if _, err := fmt.Fprintln(p.out); err != nil {
 			return 0, err
 		}
@@ -35,6 +36,7 @@ func (p *terminalProgress) Write(b []byte) (int, error) {
 	n, err := p.out.Write(b)
 	if n > 0 {
 		p.lineOpen = b[n-1] != '\n'
+		p.native = p.lineOpen
 	}
 	return n, err
 }
@@ -45,6 +47,11 @@ func (p *terminalProgress) Update(event engine.ProgressEvent) {
 	if p.out == nil || event.Phase == "" {
 		return
 	}
+	if p.lineOpen && p.native {
+		fmt.Fprintln(p.out)
+		p.lineOpen = false
+		p.native = false
+	}
 	now := time.Now()
 	if event.Phase != p.phase {
 		if p.lineOpen {
@@ -54,6 +61,7 @@ func (p *terminalProgress) Update(event engine.ProgressEvent) {
 		p.started = now
 		p.last = time.Time{}
 		p.lineOpen = false
+		p.native = false
 	}
 	if !event.Done && !p.last.IsZero() && event.Current < event.Total && now.Sub(p.last) < progressRefreshInterval {
 		return
@@ -62,9 +70,11 @@ func (p *terminalProgress) Update(event engine.ProgressEvent) {
 		if event.Done {
 			fmt.Fprintf(p.out, "%s: done.\n", event.Phase)
 			p.lineOpen = false
+			p.native = false
 		} else {
 			fmt.Fprintf(p.out, "%s...\r", event.Phase)
 			p.lineOpen = true
+			p.native = false
 		}
 		p.last = now
 		return
@@ -94,6 +104,7 @@ func (p *terminalProgress) Update(event engine.ProgressEvent) {
 	}
 	fmt.Fprintf(p.out, "%s: %3d%% (%s/%s)%s%s", event.Phase, percent, currentText, totalText, rate, suffix)
 	p.lineOpen = !event.Done
+	p.native = false
 	p.last = now
 }
 

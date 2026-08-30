@@ -93,3 +93,46 @@ func TestProgressUsesStderrAndRespectsProgressOption(t *testing.T) {
 		t.Fatalf("quiet operation emitted progress: %q", quietErr.String())
 	}
 }
+
+func TestTerminalProgressPreservesNativeCarriageReturns(t *testing.T) {
+	var out bytes.Buffer
+	progress := &terminalProgress{out: &out}
+
+	chunks := []string{
+		"Counting objects:  50% (1/2)\r",
+		"Counting objects: 100% (2/2)\r",
+		"Counting objects: 100% (2/2), done.\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := progress.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := strings.Join(chunks, "")
+	if out.String() != want {
+		t.Fatalf("native progress was rewritten:\ngot:  %q\nwant: %q", out.String(), want)
+	}
+}
+
+func TestTerminalProgressSeparatesNativeAndStructuredOutput(t *testing.T) {
+	var out bytes.Buffer
+	progress := &terminalProgress{out: &out}
+
+	progress.Update(engine.ProgressEvent{Phase: "Resolving S3 repository state"})
+	if _, err := progress.Write([]byte("Enumerating objects: 1, done.\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := progress.Write([]byte("Writing objects: 50% (1/2)\r")); err != nil {
+		t.Fatal(err)
+	}
+	progress.Update(engine.ProgressEvent{Phase: "Finalizing S3 upload", Done: true})
+
+	want := "Resolving S3 repository state...\r\n" +
+		"Enumerating objects: 1, done.\n" +
+		"Writing objects: 50% (1/2)\r\n" +
+		"Finalizing S3 upload: done.\n"
+	if out.String() != want {
+		t.Fatalf("progress sources shared a line:\ngot:  %q\nwant: %q", out.String(), want)
+	}
+}
