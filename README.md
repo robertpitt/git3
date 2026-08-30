@@ -2,6 +2,13 @@
 
 **Put a Git remote in S3. No server to run.**
 
+<p align="center">
+  <a href="https://robertpitt.github.io/git3/">Website</a> ·
+  <a href="https://github.com/robertpitt/git3/releases">Releases</a> ·
+  <a href="docs/configuration.md">Configuration</a> ·
+  <a href="docs/operations.md">Operations</a>
+</p>
+
 git3 is a Git remote helper that stores a complete, ordinary Git repository in an S3 bucket you
 control. It works with Amazon S3 and S3-compatible object storage.
 
