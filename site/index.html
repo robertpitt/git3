@@ -492,7 +492,7 @@
             Typical steady-state traces with no retries, one new transaction, an embedded log tail, and default 64 MiB download ranges. Additional transactions, log pages, large ranges, and multipart uploads add requests proportionally.
           </p>
           <p class="lg:text-right">
-            At the S3 request rates used in the benchmark, 10,000 no-op fetches cost about <strong class="font-semibold text-slate-700">$0.004</strong>; 10,000 typical small pushes about <strong class="font-semibold text-slate-700">$0.158</strong> in request charges.
+            At the S3 request rates used in the benchmark, 10,000 no-op fetches cost about <strong class="font-semibold text-slate-700">$0.0042</strong>; 10,000 typical small pushes about <strong class="font-semibold text-slate-700">$0.167</strong> in request charges.
           </p>
         </div>
       </section>
@@ -501,34 +501,34 @@
         <div class="page-shell py-20 lg:py-28">
           <div class="grid gap-12 lg:grid-cols-[0.9fr_1.1fr] lg:gap-20">
             <div>
-              <p class="eyebrow">Maintenance &amp; performance</p>
-              <h2 class="mt-4 font-display text-5xl font-medium tracking-[-0.035em] text-slate-950 sm:text-6xl">Compact locally. Clone faster.</h2>
+              <p class="eyebrow">Regional performance</p>
+              <h2 class="mt-4 font-display text-5xl font-medium tracking-[-0.035em] text-slate-950 sm:text-6xl">Fast regional Git. Simple S3 storage.</h2>
               <p class="mt-5 max-w-xl text-base leading-7 text-slate-600">
-                Maintenance turns accumulated transaction packs into compact native Git packs. It runs from your workstation or CI—never on a server you need to operate.
+                Everyday Git operations stayed sub-second in the UK-to-London benchmark. Maintenance still runs locally, compacting transaction history without a server you need to operate.
               </p>
 
               <div class="mt-9 overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-[0_30px_75px_-56px_rgba(30,41,59,0.55)] sm:p-7">
                 <div class="flex flex-wrap items-end justify-between gap-4">
                   <div>
-                    <p class="text-xs font-semibold tracking-[0.1em] text-slate-400 uppercase">Measured cold-clone improvement</p>
-                    <p class="mt-2 font-display text-6xl leading-none text-indigo-600">5.45×</p>
+                    <p class="text-xs font-semibold tracking-[0.1em] text-slate-400 uppercase">Median warm no-op fetch</p>
+                    <p class="mt-2 font-display text-6xl leading-none text-indigo-600">0.215s</p>
                   </div>
-                  <p class="text-right text-sm text-slate-500"><strong class="text-slate-900">81.64%</strong><br />less wall time</p>
+                  <p class="text-right text-sm text-slate-500"><strong class="text-slate-900">7 samples</strong><br />0.185–0.259s</p>
                 </div>
 
                 <div class="mt-8 space-y-5">
                   <div>
-                    <div class="mb-2 flex items-center justify-between text-xs"><span class="text-slate-500">Before maintenance</span><strong class="font-mono font-medium text-slate-800">340.454s</strong></div>
-                    <div class="h-2 overflow-hidden rounded-full bg-slate-100"><div class="h-full w-full rounded-full bg-slate-300"></div></div>
+                    <div class="mb-2 flex items-center justify-between text-xs"><span class="text-slate-500">Median</span><strong class="font-mono font-medium text-slate-800">215ms</strong></div>
+                    <div class="h-2 overflow-hidden rounded-full bg-slate-100"><div class="h-full w-[71.67%] rounded-full bg-slate-300"></div></div>
                   </div>
                   <div>
-                    <div class="mb-2 flex items-center justify-between text-xs"><span class="text-slate-500">After maintenance</span><strong class="font-mono font-medium text-indigo-700">62.508s</strong></div>
-                    <div class="h-2 overflow-hidden rounded-full bg-slate-100"><div class="h-full w-[18.36%] rounded-full bg-indigo-600"></div></div>
+                    <div class="mb-2 flex items-center justify-between text-xs"><span class="text-slate-500">p95</span><strong class="font-mono font-medium text-indigo-700">259ms</strong></div>
+                    <div class="h-2 overflow-hidden rounded-full bg-slate-100"><div class="h-full w-[86.33%] rounded-full bg-indigo-600"></div></div>
                   </div>
                 </div>
 
                 <p class="mt-6 border-t border-slate-100 pt-5 text-xs leading-5 text-slate-500">
-                  Measured from the UK against S3 Standard in <code class="font-mono text-slate-700">us-east-1</code> on an approximately 753 MiB synthetic repository. Maintenance itself took 185.532s.
+                  Measured from a UK client against S3 Standard in <code class="font-mono text-slate-700">eu-west-2</code>. All seven warm no-op fetches completed in under 300ms through the normal public S3 endpoint.
                 </p>
               </div>
             </div>
@@ -536,16 +536,16 @@
             <div>
               <div class="grid grid-cols-2 border-y border-slate-200">
                 <div class="border-r border-slate-200 py-6 pr-5">
-                  <p class="font-display text-3xl text-indigo-600">0.931s</p>
-                  <p class="mt-1 text-xs leading-5 text-slate-500">median warm no-op fetch</p>
+                  <p class="font-display text-3xl text-indigo-600">0.477s</p>
+                  <p class="mt-1 text-xs leading-5 text-slate-500">median small push</p>
                 </div>
                 <div class="py-6 pl-5">
-                  <p class="font-display text-3xl text-indigo-600">19.04 MiB/s</p>
+                  <p class="font-display text-3xl text-indigo-600">40.55 MiB/s</p>
                   <p class="mt-1 text-xs leading-5 text-slate-500">512 MiB incremental fetch</p>
                 </div>
                 <div class="border-t border-r border-slate-200 py-6 pr-5">
-                  <p class="font-display text-3xl text-indigo-600">0 B</p>
-                  <p class="mt-1 text-xs leading-5 text-slate-500">live WAL after maintenance</p>
+                  <p class="font-display text-3xl text-indigo-600">4 clients</p>
+                  <p class="mt-1 text-xs leading-5 text-slate-500">simultaneous ref reads in 0.282–0.286s</p>
                 </div>
                 <div class="border-t border-slate-200 py-6 pl-5">
                   <p class="font-display text-3xl text-indigo-600">Passed</p>
@@ -573,7 +573,7 @@
               </div>
 
               <div class="mt-7 flex flex-wrap gap-x-7 gap-y-3">
-                <a class="text-link" href="https://github.com/robertpitt/git3/blob/main/docs/performance/2026-08-30-aws-us-east-1-from-uk.md">Read the benchmark <span aria-hidden="true">→</span></a>
+                <a class="text-link" href="https://github.com/robertpitt/git3/blob/main/docs/performance/2026-08-30-aws-eu-west-2-from-uk.md">Read the benchmark <span aria-hidden="true">→</span></a>
                 <a class="text-link" href="https://github.com/robertpitt/git3/blob/main/docs/operations.md">Operations guide <span aria-hidden="true">→</span></a>
               </div>
             </div>
@@ -590,7 +590,7 @@
         </div>
         <div class="flex flex-wrap gap-x-6 gap-y-3">
           <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3/blob/main/SPEC.md">Specification</a>
-          <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3/blob/main/docs/performance/2026-08-30-aws-us-east-1-from-uk.md">Benchmark</a>
+          <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3/blob/main/docs/performance/2026-08-30-aws-eu-west-2-from-uk.md">Benchmark</a>
           <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3/blob/main/SECURITY.md">Security</a>
           <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3/releases">Releases</a>
           <a class="hover:text-slate-950" href="https://github.com/robertpitt/git3">Source</a>
