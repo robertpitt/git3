@@ -101,7 +101,8 @@ git s3 gc origin                 # preview only
 git s3 gc origin --execute --older-than 30d
 ```
 
-See [operations](docs/operations.md), [least-privilege IAM examples](docs/iam.md), and the normative
+See [operations](docs/operations.md), [least-privilege IAM examples](docs/iam.md),
+[event-driven builds with S3, Lambda, and CodeBuild](docs/s3-events.md), and the normative
 [SPEC](SPEC.md).
 
 ## Development
