@@ -5,6 +5,7 @@ runs it automatically. It covers canonical encoding and corruption, locator cont
 SHA-1 and SHA-256 push/fetch round trips, conditional cache no-ops, budgeted and geometric
 maintenance, cold bootstrap, GC, eight-writer CAS races, and lost publication responses.
 
-`test/fixtures` contains stable external-format examples. Real-AWS release qualification supplies an
-isolated bucket through protected CI configuration; it is intentionally not runnable against an
-unscoped user bucket.
+`test/fixtures` contains stable external-format examples. CI does not require AWS credentials or a
+live bucket: repository behavior uses the in-memory Store adapter, and S3 request construction,
+pagination, conditional operations, multipart behavior, and error mapping use an injected AWS SDK
+mock client.

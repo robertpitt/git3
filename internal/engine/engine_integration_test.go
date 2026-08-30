@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robertpitt/git3/internal/canonical"
 	gitx "github.com/robertpitt/git3/internal/git"
+	"github.com/robertpitt/git3/internal/local"
+	"github.com/robertpitt/git3/internal/model"
 	"github.com/robertpitt/git3/internal/store"
 )
 
@@ -143,8 +146,31 @@ func TestPushFetchAndIncrementalFetch(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = coldReader.Fetch(ctx, s, []string{three}, true); e != nil {
+	packsetBytes, e := mem.Get(ctx, s.Head.Packset.Object.Key, "")
+	if e != nil {
 		t.Fatal(e)
+	}
+	var packset model.Packset
+	if e = canonical.UnmarshalForward(packsetBytes.Body, &packset, model.MaxPackset); e != nil {
+		t.Fatal(e)
+	}
+	if len(packset.Levels) == 0 || len(packset.Levels[0].Packs) == 0 {
+		t.Fatal("maintenance did not publish a pack")
+	}
+	interrupted := packset.Levels[0].Packs[0]
+	packDir, e := coldReader.Git.PackDir(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.MkdirAll(packDir, 0755); e != nil {
+		t.Fatal(e)
+	}
+	interruptedPath := filepath.Join(packDir, "pack-"+interrupted.GitPackChecksum+".pack")
+	if e = os.WriteFile(interruptedPath, []byte("interrupted install"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e = coldReader.Fetch(ctx, s, []string{three}, true); e != nil {
+		t.Fatalf("fetch did not recover an interrupted pack pair install: %v", e)
 	}
 	if !coldReader.Git.HasObject(ctx, three) {
 		t.Fatal("compacted bootstrap object not installed")
@@ -169,5 +195,111 @@ func TestPushFetchAndIncrementalFetch(t *testing.T) {
 	}
 	if e = writer.Fsck(ctx, true); e != nil {
 		t.Fatal(e)
+	}
+}
+
+func TestPushDoesNotTrustTamperedCachedRefs(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "config", "user.email", "test@example.com")
+	run(t, dir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("one\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "add", "f")
+	run(t, dir, "commit", "-qm", "one")
+	one := run(t, dir, "rev-parse", "HEAD")
+
+	mem := store.NewMemory()
+	seed := &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test"}
+	if _, err := seed.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &one}}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cached := &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test", CacheID: "tampered-remote"}
+	state, err := cached.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cached.Fetch(ctx, state, []string{one}, true); err != nil {
+		t.Fatal(err)
+	}
+	ls, err := local.Resolve(ctx, cached.Git, state.Head.RepositoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := ls.ReadCursor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered, err := (model.Snapshot{
+		RepositoryID:  state.Head.RepositoryID,
+		ObjectFormat:  state.Head.ObjectFormat,
+		Generation:    state.Head.LogicalGeneration,
+		TransactionID: state.Head.TransactionID,
+		Refs:          map[string]string{},
+	}).MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ls.Write(cursor, tampered, cursor.LastHeadETag); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = os.WriteFile(filepath.Join(dir, "f"), []byte("two\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "commit", "-qam", "two")
+	two := run(t, dir, "rev-parse", "HEAD")
+	writer := &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test", CacheID: "tampered-remote"}
+	advertised, err := writer.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !advertised.Cached {
+		t.Fatal("expected the tampered cache to exercise the conditional-read path")
+	}
+	if _, err = writer.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &two}}, true); err != nil {
+		t.Fatalf("push from a cache hit should use verified remote refs: %v", err)
+	}
+	verified, err := writer.ReadUnconditional(ctx)
+	if err != nil {
+		t.Fatalf("push published an unreadable transaction chain: %v", err)
+	}
+	if got := verified.Refs["refs/heads/main"]; got != two {
+		t.Fatalf("remote main = %s, want %s", got, two)
+	}
+}
+
+func TestAtomicInitialPushRejectsEntireInvalidBatch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "config", "user.email", "test@example.com")
+	run(t, dir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("one\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "add", "f")
+	run(t, dir, "commit", "-qm", "one")
+	one := run(t, dir, "rev-parse", "HEAD")
+
+	mem := store.NewMemory()
+	repo := &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test"}
+	results, err := repo.Push(ctx, []PushCommand{
+		{Dst: "refs/heads/main", NewOID: &one},
+		{Dst: "refs/heads/.invalid", NewOID: &one},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range results {
+		if result.OK {
+			t.Fatalf("atomic initialization partially accepted %#v", results)
+		}
+	}
+	if _, err = mem.Get(ctx, ".git/git3/HEAD", ""); err != store.ErrNotFound {
+		t.Fatalf("atomic initialization published HEAD: %v", err)
 	}
 }

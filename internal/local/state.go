@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/robertpitt/git3/internal/canonical"
@@ -34,8 +35,7 @@ func Resolve(ctx context.Context, g gitx.Git, repoID string) (State, error) {
 
 // Lock serializes updates to repository-local state.
 type Lock struct {
-	path string
-	f    *os.File
+	f *os.File
 }
 
 // Lock acquires the repository-local state lock.
@@ -46,12 +46,27 @@ func (s State) Lock(ctx context.Context) (*Lock, error) {
 	p := filepath.Join(s.Root, "state.lock")
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		f, e := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if e == nil {
-			fmt.Fprintf(f, "%d\n", os.Getpid())
-			return &Lock{p, f}, nil
+		f, e := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0600)
+		if e != nil {
+			return nil, e
 		}
-		if !errors.Is(e, os.ErrExist) {
+		e = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if e == nil {
+			if e = f.Truncate(0); e == nil {
+				_, e = f.Seek(0, 0)
+			}
+			if e == nil {
+				_, e = fmt.Fprintf(f, "%d\n", os.Getpid())
+			}
+			if e != nil {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = f.Close()
+				return nil, e
+			}
+			return &Lock{f: f}, nil
+		}
+		_ = f.Close()
+		if !errors.Is(e, syscall.EWOULDBLOCK) && !errors.Is(e, syscall.EAGAIN) {
 			return nil, e
 		}
 		if time.Now().After(deadline) {
@@ -67,8 +82,12 @@ func (s State) Lock(ctx context.Context) (*Lock, error) {
 
 // Close releases the repository-local state lock.
 func (l *Lock) Close() error {
-	_ = l.f.Close()
-	return os.Remove(l.path)
+	unlockErr := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+	closeErr := l.f.Close()
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
 }
 func atomicWrite(path string, b []byte) error {
 	if e := os.MkdirAll(filepath.Dir(path), 0700); e != nil {

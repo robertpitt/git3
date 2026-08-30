@@ -26,20 +26,21 @@ import (
 
 // Repository coordinates Git, local state, and object storage for one remote.
 type Repository struct {
-	Store               store.Store
-	Git                 gitx.Git
-	Version             string
-	Pinned              *RemoteState
-	StoragePolicy       model.StoragePolicy
-	DryRun              bool
-	DownloadChunkSize   int64
-	DownloadConcurrency int
-	CacheID             string
-	InstalledKeeps      []string
-	Warnings            []string
-	CompactionFanout    int
-	MaintenanceMaxBytes int64
-	CompactAfterBytes   uint64
+	Store                    store.Store
+	Git                      gitx.Git
+	Version                  string
+	Pinned                   *RemoteState
+	StoragePolicy            model.StoragePolicy
+	DryRun                   bool
+	DownloadChunkSize        int64
+	DownloadConcurrency      int
+	CacheID                  string
+	InstalledKeeps           []string
+	Warnings                 []string
+	CompactionFanout         int
+	CompactAfterTransactions int
+	MaintenanceMaxBytes      int64
+	CompactAfterBytes        uint64
 }
 
 // RemoteState is a validated materialized view of a remote repository.
@@ -298,6 +299,17 @@ func (r *Repository) Push(ctx context.Context, cmds []PushCommand, atomic bool) 
 			return nil, e
 		}
 	}
+	if state.Cached {
+		advertisedETag := state.ETag
+		verified, e := r.ReadUnconditional(ctx)
+		if e != nil {
+			return nil, e
+		}
+		if verified.ETag != advertisedETag {
+			return nil, errs.E(errs.CASConflict, "push", fmt.Errorf("remote changed since ref advertisement"))
+		}
+		state = verified
+	}
 	format, e := r.Git.ObjectFormat(ctx)
 	if e != nil {
 		return nil, e
@@ -309,22 +321,8 @@ func (r *Repository) Push(ctx context.Context, cmds []PushCommand, atomic bool) 
 		return nil, fmt.Errorf("local encryption settings conflict with repository storage policy")
 	}
 	updates, res := r.validatePush(ctx, state, cmds)
-	if atomic {
-		bad := false
-		for _, x := range res {
-			if !x.OK {
-				bad = true
-			}
-		}
-		if bad {
-			for i := range res {
-				res[i].OK = false
-				if res[i].Reason == "" {
-					res[i].Reason = "atomic push rejected"
-				}
-			}
-			return res, nil
-		}
+	if rejectAtomicBatch(res, atomic) {
+		return res, nil
 	}
 	if len(updates) == 0 {
 		return res, nil
@@ -389,6 +387,29 @@ func (r *Repository) Push(ctx context.Context, cmds []PushCommand, atomic bool) 
 	}
 	r.Pinned = nil
 	return res, nil
+}
+
+func rejectAtomicBatch(results []PushResult, atomic bool) bool {
+	if !atomic {
+		return false
+	}
+	bad := false
+	for _, result := range results {
+		if !result.OK {
+			bad = true
+			break
+		}
+	}
+	if !bad {
+		return false
+	}
+	for i := range results {
+		results[i].OK = false
+		if results[i].Reason == "" {
+			results[i].Reason = "atomic push rejected"
+		}
+	}
+	return true
 }
 func policyEqual(a, b model.StoragePolicy) bool {
 	if a.ServerSideEncryption != b.ServerSideEncryption {
@@ -570,6 +591,9 @@ func (r *Repository) initialize(ctx context.Context, cmds []PushCommand, atomic 
 	repoID := uuid.NewString()
 	zero := &RemoteState{Head: model.Head{RepositoryID: repoID, ObjectFormat: format, LogicalGeneration: 0, TransactionID: nil}, Refs: map[string]string{}}
 	updates, res := r.validatePush(ctx, zero, cmds)
+	if rejectAtomicBatch(res, atomic) {
+		return res, nil
+	}
 	branches := []string{}
 	for _, u := range updates {
 		if u.New != nil && strings.HasPrefix(u.Ref, "refs/heads/") {
@@ -857,57 +881,26 @@ func (r *Repository) installPackset(ctx context.Context, ls local.State, s *Remo
 			packCount++
 			pp := filepath.Join(ls.PackDir, "pack-"+p.GitPackChecksum+".pack")
 			ip := filepath.Join(ls.PackDir, "pack-"+p.GitPackChecksum+".idx")
-			_, pe := os.Stat(pp)
-			_, ie := os.Stat(ip)
-			if pe == nil || ie == nil {
-				if pe != nil || ie != nil {
-					return fmt.Errorf("unpaired local pack %s", p.GitPackChecksum)
-				}
-				pn, psh, e := fileDigestLocal(pp)
-				if e != nil || uint64(pn) != p.Pack.Size || psh != p.Pack.SHA256 {
-					return fmt.Errorf("existing pack integrity mismatch")
-				}
-				in, ish, e := fileDigestLocal(ip)
-				if e != nil || uint64(in) != p.Index.Size || ish != p.Index.SHA256 {
-					return fmt.Errorf("existing index integrity mismatch")
-				}
-				if e = verifyTrailer(pp, p.GitPackChecksum); e != nil {
-					return e
-				}
-				if e = r.Git.VerifyPack(ctx, ip); e != nil {
-					return e
-				}
-				if n, e := r.Git.CountPackObjects(ctx, ip); e != nil || n != p.ObjectCount {
-					if e != nil {
-						return e
-					}
-					return fmt.Errorf("pack object count mismatch")
-				}
-				continue
-			}
-			if e = r.downloadVerified(ctx, p.Pack, pp+".part"); e != nil {
+			packExists, e := pathExists(pp)
+			if e != nil {
 				return e
 			}
-			if e = r.downloadVerified(ctx, p.Index, ip+".part"); e != nil {
+			indexExists, e := pathExists(ip)
+			if e != nil {
 				return e
 			}
-			if e = verifyTrailer(pp+".part", p.GitPackChecksum); e != nil {
-				return e
-			}
-			if e = os.Rename(pp+".part", pp); e != nil {
-				return e
-			}
-			if e = os.Rename(ip+".part", ip); e != nil {
-				return e
-			}
-			if e = r.Git.VerifyPack(ctx, ip); e != nil {
-				return e
-			}
-			if n, e := r.Git.CountPackObjects(ctx, ip); e != nil || n != p.ObjectCount {
-				if e != nil {
-					return e
+			if packExists && indexExists {
+				if e = r.verifyPackPair(ctx, p, pp, ip); e == nil {
+					continue
 				}
-				return fmt.Errorf("pack object count mismatch")
+			}
+			if packExists || indexExists {
+				if e = removePackPair(pp, ip); e != nil {
+					return fmt.Errorf("repair interrupted pack install: %w", e)
+				}
+			}
+			if e = r.installPackPair(ctx, ls, p, pp, ip); e != nil {
+				return e
 			}
 		}
 	}
@@ -915,6 +908,83 @@ func (r *Repository) installPackset(ctx context.Context, ls local.State, s *Remo
 		if e = r.Git.WriteMIDX(ctx); e != nil {
 			return e
 		}
+	}
+	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func removePackPair(packPath, indexPath string) error {
+	for _, path := range []string{packPath, indexPath} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Repository) verifyPackPair(ctx context.Context, entry model.PackEntry, packPath, indexPath string) error {
+	pn, packSHA, err := fileDigestLocal(packPath)
+	if err != nil || uint64(pn) != entry.Pack.Size || packSHA != entry.Pack.SHA256 {
+		return fmt.Errorf("pack integrity mismatch")
+	}
+	in, indexSHA, err := fileDigestLocal(indexPath)
+	if err != nil || uint64(in) != entry.Index.Size || indexSHA != entry.Index.SHA256 {
+		return fmt.Errorf("index integrity mismatch")
+	}
+	if err = verifyTrailer(packPath, entry.GitPackChecksum); err != nil {
+		return err
+	}
+	if err = r.Git.VerifyPack(ctx, indexPath); err != nil {
+		return err
+	}
+	count, err := r.Git.CountPackObjects(ctx, indexPath)
+	if err != nil {
+		return err
+	}
+	if count != entry.ObjectCount {
+		return fmt.Errorf("pack object count mismatch")
+	}
+	return nil
+}
+
+func (r *Repository) installPackPair(ctx context.Context, ls local.State, entry model.PackEntry, packPath, indexPath string) error {
+	stage, err := os.MkdirTemp(ls.Root, "pack-install-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	base := "pack-" + entry.GitPackChecksum
+	stagedPack := filepath.Join(stage, base+".pack")
+	stagedIndex := filepath.Join(stage, base+".idx")
+	if err = r.downloadVerified(ctx, entry.Pack, stagedPack); err != nil {
+		return err
+	}
+	if err = r.downloadVerified(ctx, entry.Index, stagedIndex); err != nil {
+		return err
+	}
+	if err = r.verifyPackPair(ctx, entry, stagedPack, stagedIndex); err != nil {
+		return err
+	}
+	if err = os.Rename(stagedPack, packPath); err != nil {
+		return err
+	}
+	if err = os.Rename(stagedIndex, indexPath); err != nil {
+		_ = os.Remove(packPath)
+		return err
+	}
+	if dir, openErr := os.Open(ls.PackDir); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return nil
 }

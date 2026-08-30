@@ -30,6 +30,7 @@ var version = "dev"
 var commit = "unknown"
 var buildTime = "unknown"
 var dirty = "true"
+var resolvedLogFormat = "human"
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -78,6 +79,7 @@ func repository(ctx context.Context, target string) (*engine.Repository, error) 
 	if e != nil {
 		return nil, e
 	}
+	resolvedLogFormat = c.LogFormat
 	s, e := store.NewS3(ctx, l, c)
 	if e != nil {
 		return nil, e
@@ -95,7 +97,7 @@ func repository(ctx context.Context, target string) (*engine.Repository, error) 
 		policy.BucketKeyEnabled = c.BucketKeyEnabled
 	}
 	cache := fmt.Sprintf("%x", sha256.Sum256([]byte(l.String())))
-	return &engine.Repository{Store: s, Git: g, Version: version, StoragePolicy: policy, DownloadChunkSize: c.DownloadChunkSize, DownloadConcurrency: c.DownloadConcurrency, CacheID: cache, CompactionFanout: c.CompactionFanout, CompactAfterBytes: uint64(c.CompactAfterBytes)}, nil
+	return &engine.Repository{Store: s, Git: g, Version: version, StoragePolicy: policy, DownloadChunkSize: c.DownloadChunkSize, DownloadConcurrency: c.DownloadConcurrency, CacheID: cache, CompactionFanout: c.CompactionFanout, CompactAfterTransactions: c.CompactAfterTransactions, CompactAfterBytes: uint64(c.CompactAfterBytes)}, nil
 }
 func command(ctx context.Context) *cobra.Command {
 	root := &cobra.Command{Use: "git3", SilenceUsage: true}
@@ -108,7 +110,11 @@ func command(ctx context.Context) *cobra.Command {
 		if e != nil {
 			return e
 		}
-		rep, e := r.Doctor(ctx, 32)
+		threshold := r.CompactAfterTransactions
+		if threshold < 1 {
+			threshold = 32
+		}
+		rep, e := r.Doctor(ctx, threshold)
 		if asJSON {
 			_ = json.NewEncoder(os.Stdout).Encode(rep)
 		} else if e == nil {
@@ -284,7 +290,7 @@ func fatalIf(e error) {
 }
 func fatal(e error) {
 	code := errs.CodeOf(e)
-	if os.Getenv("GIT3_LOG_FORMAT") == "json" {
+	if resolvedLogFormat == "json" || os.Getenv("GIT3_LOG_FORMAT") == "json" {
 		_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339), "level": "error", "code": code, "message": e.Error(), "git3Version": version})
 	} else {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", code, e)

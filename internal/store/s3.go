@@ -21,21 +21,28 @@ import (
 
 // S3 implements Store using Amazon S3-compatible APIs.
 type S3 struct {
-	client     *s3.Client
+	client     s3API
 	bucket     string
 	loc        locator.Locator
 	cfg        config.Config
 	encryption types.ServerSideEncryption
 }
 
+type s3API interface {
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
 // NewS3 creates an S3-backed store for l using c.
 func NewS3(ctx context.Context, l locator.Locator, c config.Config) (*S3, error) {
-	opts := []func(*awsconfig.LoadOptions) error{}
-	if c.Region != "" {
-		opts = append(opts, awsconfig.WithRegion(c.Region))
-	}
-	opts = append(opts, awsconfig.WithRetryMaxAttempts(c.MaxAttempts))
-	ac, e := awsconfig.LoadDefaultConfig(ctx, opts...)
+	ac, e := loadAWSConfig(ctx, c)
 	if e != nil {
 		return nil, e
 	}
@@ -52,6 +59,18 @@ func NewS3(ctx context.Context, l locator.Locator, c config.Config) (*S3, error)
 		x.encryption = types.ServerSideEncryptionAwsKms
 	}
 	return x, nil
+}
+
+func loadAWSConfig(ctx context.Context, c config.Config) (aws.Config, error) {
+	opts := []func(*awsconfig.LoadOptions) error{}
+	if c.Region != "" {
+		opts = append(opts, awsconfig.WithRegion(c.Region))
+	}
+	if c.Profile != "" {
+		opts = append(opts, awsconfig.WithSharedConfigProfile(c.Profile))
+	}
+	opts = append(opts, awsconfig.WithRetryMaxAttempts(c.MaxAttempts))
+	return awsconfig.LoadDefaultConfig(ctx, opts...)
 }
 func (s *S3) key(k string) string { return s.loc.Key(k) }
 func mapS3(err error) error {

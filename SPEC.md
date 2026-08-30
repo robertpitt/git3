@@ -590,7 +590,7 @@ indexes from installed native packs.
 Configuration precedence, from highest to lowest, is:
 
 1. administrative CLI flags, where applicable;
-2. `GIT3_*` environment variables;
+2. configuration environment variables, including `AWS_PROFILE` and `GIT3_*`;
 3. `remote.<name>.git3*` configuration for a named Git remote;
 4. repository-local, global, and system `git3.*` configuration in normal Git precedence order;
 5. documented defaults.
@@ -603,6 +603,7 @@ dynamic reload is not required.
 
 | Git configuration | Environment | Default | Contract |
 | --- | --- | --- | --- |
+| `git3.profile` | `AWS_PROFILE` | AWS resolution | Optional shared AWS configuration profile. |
 | `git3.region` | `GIT3_REGION` | AWS resolution | Optional signing and bucket region. |
 | `git3.endpoint` | `GIT3_ENDPOINT` | AWS endpoint | Optional absolute custom endpoint URL. |
 | `git3.pathStyle` | `GIT3_PATH_STYLE` | `false` | Use path-style S3 addressing. |
@@ -612,7 +613,6 @@ dynamic reload is not required.
 | `git3.bucketKeyEnabled` | `GIT3_BUCKET_KEY_ENABLED` | unset | Optional S3 Bucket Key choice for KMS. |
 | `git3.multipartThreshold` | `GIT3_MULTIPART_THRESHOLD` | `100MiB` | Minimum object size for multipart when size is known. |
 | `git3.partSize` | `GIT3_PART_SIZE` | `128MiB` | Multipart upload part size. |
-| `git3.uploadConcurrency` | `GIT3_UPLOAD_CONCURRENCY` | `2` | Concurrent multipart buffers/uploads. |
 | `git3.downloadChunkSize` | `GIT3_DOWNLOAD_CHUNK_SIZE` | `64MiB` | Byte-range chunk size. |
 | `git3.downloadConcurrency` | `GIT3_DOWNLOAD_CONCURRENCY` | `4` | Concurrent range reads per object. |
 | `git3.maxAttempts` | `GIT3_MAX_ATTEMPTS` | `5` | Maximum attempts for a retryable request. |
@@ -1877,8 +1877,8 @@ The complete target is conformant only when:
 - every core command and remote-helper behavior in this specification is implemented;
 - all version 1 formats have golden fixtures and corruption fixtures;
 - the full validation matrix passes at the required level;
-- AWS integration proves conditional initialization, push CAS, conditional read, multipart transfer,
-  range download, SSE-S3, SSE-KMS, and conditional GC deletion;
+- adapter contract tests with AWS SDK mocks prove conditional requests, multipart transfer, range
+  download, encryption request construction, pagination, error mapping, and conditional deletion;
 - no normal Git operation issues `LIST` or delete;
 - fault injection covers every publication boundary;
 - documentation includes setup, least-privilege IAM, encryption, custom endpoint caveats, disaster

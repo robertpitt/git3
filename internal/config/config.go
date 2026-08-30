@@ -11,6 +11,7 @@ import (
 
 // Config contains the resolved client configuration.
 type Config struct {
+	Profile                  string
 	Region                   string
 	Endpoint                 string
 	PathStyle                bool
@@ -21,7 +22,6 @@ type Config struct {
 	MultipartThreshold       int64
 	PartSize                 int64
 	DownloadChunkSize        int64
-	UploadConcurrency        int
 	DownloadConcurrency      int
 	MaxAttempts              int
 	CompactionFanout         int
@@ -36,7 +36,6 @@ func Defaults() Config {
 		SSE:                      "inherit",
 		MultipartThreshold:       100 << 20,
 		PartSize:                 128 << 20,
-		UploadConcurrency:        2,
 		DownloadChunkSize:        64 << 20,
 		DownloadConcurrency:      4,
 		MaxAttempts:              5,
@@ -50,7 +49,7 @@ func Defaults() Config {
 // FromEnv returns a configuration populated from environment variables.
 func FromEnv() (Config, error) {
 	c := Defaults()
-	vals := map[string]*string{"GIT3_REGION": &c.Region, "GIT3_ENDPOINT": &c.Endpoint, "GIT3_SSE": &c.SSE, "GIT3_KMS_KEY_ID": &c.KMSKeyID, "GIT3_LOG_FORMAT": &c.LogFormat}
+	vals := map[string]*string{"AWS_PROFILE": &c.Profile, "GIT3_REGION": &c.Region, "GIT3_ENDPOINT": &c.Endpoint, "GIT3_SSE": &c.SSE, "GIT3_KMS_KEY_ID": &c.KMSKeyID, "GIT3_LOG_FORMAT": &c.LogFormat}
 	for k, p := range vals {
 		if v, ok := os.LookupEnv(k); ok {
 			*p = v
@@ -81,7 +80,7 @@ func FromEnv() (Config, error) {
 			*p = n
 		}
 	}
-	for k, p := range map[string]*int{"GIT3_UPLOAD_CONCURRENCY": &c.UploadConcurrency, "GIT3_DOWNLOAD_CONCURRENCY": &c.DownloadConcurrency, "GIT3_MAX_ATTEMPTS": &c.MaxAttempts, "GIT3_COMPACTION_FANOUT": &c.CompactionFanout, "GIT3_COMPACT_AFTER_TRANSACTIONS": &c.CompactAfterTransactions} {
+	for k, p := range map[string]*int{"GIT3_DOWNLOAD_CONCURRENCY": &c.DownloadConcurrency, "GIT3_MAX_ATTEMPTS": &c.MaxAttempts, "GIT3_COMPACTION_FANOUT": &c.CompactionFanout, "GIT3_COMPACT_AFTER_TRANSACTIONS": &c.CompactAfterTransactions} {
 		if v, ok := os.LookupEnv(k); ok {
 			n, e := strconv.Atoi(v)
 			if e != nil || n < 1 || n > 1024 {
@@ -115,6 +114,7 @@ func FromEnv() (Config, error) {
 func Load(remote string) (Config, error) {
 	c := Defaults()
 	defs := []struct{ env, global, suffix string }{
+		{"AWS_PROFILE", "git3.profile", "git3Profile"},
 		{"GIT3_REGION", "git3.region", "git3Region"},
 		{"GIT3_ENDPOINT", "git3.endpoint", "git3Endpoint"},
 		{"GIT3_PATH_STYLE", "git3.pathStyle", "git3PathStyle"},
@@ -124,7 +124,6 @@ func Load(remote string) (Config, error) {
 		{"GIT3_BUCKET_KEY_ENABLED", "git3.bucketKeyEnabled", "git3BucketKeyEnabled"},
 		{"GIT3_MULTIPART_THRESHOLD", "git3.multipartThreshold", "git3MultipartThreshold"},
 		{"GIT3_PART_SIZE", "git3.partSize", "git3PartSize"},
-		{"GIT3_UPLOAD_CONCURRENCY", "git3.uploadConcurrency", "git3UploadConcurrency"},
 		{"GIT3_DOWNLOAD_CHUNK_SIZE", "git3.downloadChunkSize", "git3DownloadChunkSize"},
 		{"GIT3_DOWNLOAD_CONCURRENCY", "git3.downloadConcurrency", "git3DownloadConcurrency"},
 		{"GIT3_MAX_ATTEMPTS", "git3.maxAttempts", "git3MaxAttempts"},
@@ -167,7 +166,7 @@ func gitValue(key string) (string, bool) {
 	return strings.TrimSpace(string(b)), true
 }
 func applyEnvironment(c *Config) error {
-	for _, k := range []string{"GIT3_REGION", "GIT3_ENDPOINT", "GIT3_PATH_STYLE", "GIT3_ALLOW_INSECURE_ENDPOINT", "GIT3_SSE", "GIT3_KMS_KEY_ID", "GIT3_BUCKET_KEY_ENABLED", "GIT3_MULTIPART_THRESHOLD", "GIT3_PART_SIZE", "GIT3_UPLOAD_CONCURRENCY", "GIT3_DOWNLOAD_CHUNK_SIZE", "GIT3_DOWNLOAD_CONCURRENCY", "GIT3_MAX_ATTEMPTS", "GIT3_LOG_FORMAT", "GIT3_COMPACTION_FANOUT", "GIT3_COMPACT_AFTER_TRANSACTIONS", "GIT3_COMPACT_AFTER_BYTES"} {
+	for _, k := range []string{"AWS_PROFILE", "GIT3_REGION", "GIT3_ENDPOINT", "GIT3_PATH_STYLE", "GIT3_ALLOW_INSECURE_ENDPOINT", "GIT3_SSE", "GIT3_KMS_KEY_ID", "GIT3_BUCKET_KEY_ENABLED", "GIT3_MULTIPART_THRESHOLD", "GIT3_PART_SIZE", "GIT3_DOWNLOAD_CHUNK_SIZE", "GIT3_DOWNLOAD_CONCURRENCY", "GIT3_MAX_ATTEMPTS", "GIT3_LOG_FORMAT", "GIT3_COMPACTION_FANOUT", "GIT3_COMPACT_AFTER_TRANSACTIONS", "GIT3_COMPACT_AFTER_BYTES"} {
 		if v, ok := os.LookupEnv(k); ok {
 			if e := apply(c, k, v); e != nil {
 				return e
@@ -182,6 +181,8 @@ func apply(c *Config, k, v string) error {
 	var i int
 	var b bool
 	switch k {
+	case "AWS_PROFILE":
+		c.Profile = v
 	case "GIT3_REGION":
 		c.Region = v
 	case "GIT3_ENDPOINT":
@@ -217,9 +218,7 @@ func apply(c *Config, k, v string) error {
 		if e == nil && (i < 1 || i > 1024) {
 			e = fmt.Errorf("value out of range")
 		}
-		if k == "GIT3_UPLOAD_CONCURRENCY" {
-			c.UploadConcurrency = i
-		} else if k == "GIT3_DOWNLOAD_CONCURRENCY" {
+		if k == "GIT3_DOWNLOAD_CONCURRENCY" {
 			c.DownloadConcurrency = i
 		} else if k == "GIT3_MAX_ATTEMPTS" {
 			c.MaxAttempts = i
@@ -243,7 +242,7 @@ func (c Config) Validate() error {
 	if c.PartSize > 5<<30 || c.MultipartThreshold < 0 || c.MultipartThreshold > 1<<40 || c.DownloadChunkSize < 1<<20 || c.DownloadChunkSize > 5<<30 || c.CompactAfterBytes < 1 || c.CompactAfterBytes > 1<<40 {
 		return fmt.Errorf("byte setting outside supported bounds")
 	}
-	if c.UploadConcurrency < 1 || c.UploadConcurrency > 64 || c.DownloadConcurrency < 1 || c.DownloadConcurrency > 64 || c.MaxAttempts < 1 || c.MaxAttempts > 20 || c.CompactionFanout < 2 || c.CompactionFanout > 1024 || c.CompactAfterTransactions < 1 || c.CompactAfterTransactions > 100000 {
+	if c.DownloadConcurrency < 1 || c.DownloadConcurrency > 64 || c.MaxAttempts < 1 || c.MaxAttempts > 20 || c.CompactionFanout < 2 || c.CompactionFanout > 1024 || c.CompactAfterTransactions < 1 || c.CompactAfterTransactions > 100000 {
 		return fmt.Errorf("integer setting outside supported bounds")
 	}
 	if c.Endpoint != "" {
