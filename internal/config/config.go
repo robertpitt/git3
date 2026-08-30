@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -21,6 +23,7 @@ type Config struct {
 	BucketKeyEnabled         *bool
 	MultipartThreshold       int64
 	PartSize                 int64
+	UploadConcurrency        int
 	DownloadChunkSize        int64
 	DownloadConcurrency      int
 	MaxAttempts              int
@@ -36,6 +39,7 @@ func Defaults() Config {
 		SSE:                      "inherit",
 		MultipartThreshold:       100 << 20,
 		PartSize:                 128 << 20,
+		UploadConcurrency:        2,
 		DownloadChunkSize:        64 << 20,
 		DownloadConcurrency:      4,
 		MaxAttempts:              5,
@@ -44,70 +48,6 @@ func Defaults() Config {
 		CompactAfterTransactions: 32,
 		CompactAfterBytes:        128 << 20,
 	}
-}
-
-// FromEnv returns a configuration populated from environment variables.
-func FromEnv() (Config, error) {
-	c := Defaults()
-	vals := map[string]*string{"AWS_PROFILE": &c.Profile, "GIT3_REGION": &c.Region, "GIT3_ENDPOINT": &c.Endpoint, "GIT3_SSE": &c.SSE, "GIT3_KMS_KEY_ID": &c.KMSKeyID, "GIT3_LOG_FORMAT": &c.LogFormat}
-	for k, p := range vals {
-		if v, ok := os.LookupEnv(k); ok {
-			*p = v
-		}
-	}
-	for k, p := range map[string]*bool{"GIT3_PATH_STYLE": &c.PathStyle, "GIT3_ALLOW_INSECURE_ENDPOINT": &c.AllowInsecure} {
-		if v, ok := os.LookupEnv(k); ok {
-			b, e := parseBool(v)
-			if e != nil {
-				return c, fmt.Errorf("%s: %w", k, e)
-			}
-			*p = b
-		}
-	}
-	if v, ok := os.LookupEnv("GIT3_BUCKET_KEY_ENABLED"); ok {
-		b, e := parseBool(v)
-		if e != nil {
-			return c, e
-		}
-		c.BucketKeyEnabled = &b
-	}
-	for k, p := range map[string]*int64{"GIT3_MULTIPART_THRESHOLD": &c.MultipartThreshold, "GIT3_PART_SIZE": &c.PartSize, "GIT3_DOWNLOAD_CHUNK_SIZE": &c.DownloadChunkSize, "GIT3_COMPACT_AFTER_BYTES": &c.CompactAfterBytes} {
-		if v, ok := os.LookupEnv(k); ok {
-			n, e := ParseBytes(v)
-			if e != nil {
-				return c, fmt.Errorf("%s: %w", k, e)
-			}
-			*p = n
-		}
-	}
-	for k, p := range map[string]*int{"GIT3_DOWNLOAD_CONCURRENCY": &c.DownloadConcurrency, "GIT3_MAX_ATTEMPTS": &c.MaxAttempts, "GIT3_COMPACTION_FANOUT": &c.CompactionFanout, "GIT3_COMPACT_AFTER_TRANSACTIONS": &c.CompactAfterTransactions} {
-		if v, ok := os.LookupEnv(k); ok {
-			n, e := strconv.Atoi(v)
-			if e != nil || n < 1 || n > 1024 {
-				return c, fmt.Errorf("invalid %s", k)
-			}
-			*p = n
-		}
-	}
-	if c.PartSize < 5<<20 || c.PartSize < (1<<40+9999)/10000 {
-		return c, fmt.Errorf("part size cannot support 1 TiB within 10,000 parts")
-	}
-	if c.Endpoint != "" {
-		u, e := url.Parse(c.Endpoint)
-		if e != nil || u.Host == "" || u.Scheme != "https" && (u.Scheme != "http" || !c.AllowInsecure) {
-			return c, fmt.Errorf("invalid or insecure endpoint")
-		}
-	}
-	if c.SSE != "inherit" && c.SSE != "s3" && c.SSE != "kms" {
-		return c, fmt.Errorf("invalid SSE mode")
-	}
-	if c.SSE != "kms" && (c.KMSKeyID != "" || c.BucketKeyEnabled != nil) {
-		return c, fmt.Errorf("KMS settings require sse=kms")
-	}
-	if c.LogFormat != "human" && c.LogFormat != "json" {
-		return c, fmt.Errorf("invalid log format")
-	}
-	return c, c.Validate()
 }
 
 // Load applies normal Git precedence, then named-remote overrides, then environment overrides.
@@ -124,6 +64,7 @@ func Load(remote string) (Config, error) {
 		{"GIT3_BUCKET_KEY_ENABLED", "git3.bucketKeyEnabled", "git3BucketKeyEnabled"},
 		{"GIT3_MULTIPART_THRESHOLD", "git3.multipartThreshold", "git3MultipartThreshold"},
 		{"GIT3_PART_SIZE", "git3.partSize", "git3PartSize"},
+		{"GIT3_UPLOAD_CONCURRENCY", "git3.uploadConcurrency", "git3UploadConcurrency"},
 		{"GIT3_DOWNLOAD_CHUNK_SIZE", "git3.downloadChunkSize", "git3DownloadChunkSize"},
 		{"GIT3_DOWNLOAD_CONCURRENCY", "git3.downloadConcurrency", "git3DownloadConcurrency"},
 		{"GIT3_MAX_ATTEMPTS", "git3.maxAttempts", "git3MaxAttempts"},
@@ -132,48 +73,77 @@ func Load(remote string) (Config, error) {
 		{"GIT3_COMPACT_AFTER_TRANSACTIONS", "git3.compactAfterTransactions", "git3CompactAfterTransactions"},
 		{"GIT3_COMPACT_AFTER_BYTES", "git3.compactAfterBytes", "git3CompactAfterBytes"},
 	}
+	values, e := readGitConfig()
+	if e != nil {
+		return c, e
+	}
 	for _, d := range defs {
-		if _, ok := os.LookupEnv(d.env); ok {
-			continue
-		}
-		key := d.global
+		v, ok := values.global(d.global)
 		if remote != "" {
-			rk := "remote." + remote + "." + d.suffix
-			if v, ok := gitValue(rk); ok {
-				if e := apply(&c, d.env, v); e != nil {
-					return c, e
-				}
-				continue
+			if remoteValue, found := values.remote(remote, d.suffix); found {
+				v, ok = remoteValue, true
 			}
 		}
-		if v, ok := gitValue(key); ok {
+		if environmentValue, found := os.LookupEnv(d.env); found {
+			v, ok = environmentValue, true
+		}
+		if ok {
 			if e := apply(&c, d.env, v); e != nil {
 				return c, e
 			}
 		}
 	}
-	e := applyEnvironment(&c)
-	if e != nil {
-		return c, e
-	}
 	return c, c.Validate()
 }
-func gitValue(key string) (string, bool) {
-	b, e := exec.Command("git", "config", "--get", key).Output()
+
+type gitConfigEntry struct{ key, value string }
+type gitConfigEntries []gitConfigEntry
+
+func readGitConfig() (gitConfigEntries, error) {
+	b, e := exec.Command("git", "config", "--null", "--get-regexp", `^(git3\.|remote\..*\.git3)`).Output()
 	if e != nil {
-		return "", false
+		var exit *exec.ExitError
+		if errors.As(e, &exit) && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read Git configuration: %w", e)
 	}
-	return strings.TrimSpace(string(b)), true
+	var out gitConfigEntries
+	for _, record := range bytes.Split(b, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		key, value, ok := bytes.Cut(record, []byte{'\n'})
+		if !ok {
+			return nil, fmt.Errorf("invalid Git configuration record")
+		}
+		out = append(out, gitConfigEntry{key: string(key), value: string(value)})
+	}
+	return out, nil
 }
-func applyEnvironment(c *Config) error {
-	for _, k := range []string{"AWS_PROFILE", "GIT3_REGION", "GIT3_ENDPOINT", "GIT3_PATH_STYLE", "GIT3_ALLOW_INSECURE_ENDPOINT", "GIT3_SSE", "GIT3_KMS_KEY_ID", "GIT3_BUCKET_KEY_ENABLED", "GIT3_MULTIPART_THRESHOLD", "GIT3_PART_SIZE", "GIT3_DOWNLOAD_CHUNK_SIZE", "GIT3_DOWNLOAD_CONCURRENCY", "GIT3_MAX_ATTEMPTS", "GIT3_LOG_FORMAT", "GIT3_COMPACTION_FANOUT", "GIT3_COMPACT_AFTER_TRANSACTIONS", "GIT3_COMPACT_AFTER_BYTES"} {
-		if v, ok := os.LookupEnv(k); ok {
-			if e := apply(c, k, v); e != nil {
-				return e
-			}
+
+func (v gitConfigEntries) global(key string) (string, bool) {
+	for i := len(v) - 1; i >= 0; i-- {
+		if strings.EqualFold(v[i].key, key) {
+			return v[i].value, true
 		}
 	}
-	return nil
+	return "", false
+}
+
+func (v gitConfigEntries) remote(remote, suffix string) (string, bool) {
+	for i := len(v) - 1; i >= 0; i-- {
+		key := v[i].key
+		if len(key) < len("remote.") || !strings.EqualFold(key[:len("remote.")], "remote.") {
+			continue
+		}
+		rest := key[len("remote."):]
+		marker := "." + suffix
+		if len(rest) > len(marker) && rest[:len(rest)-len(marker)] == remote && strings.EqualFold(rest[len(rest)-len(marker):], marker) {
+			return v[i].value, true
+		}
+	}
+	return "", false
 }
 func apply(c *Config, k, v string) error {
 	var e error
@@ -218,7 +188,9 @@ func apply(c *Config, k, v string) error {
 		if e == nil && (i < 1 || i > 1024) {
 			e = fmt.Errorf("value out of range")
 		}
-		if k == "GIT3_DOWNLOAD_CONCURRENCY" {
+		if k == "GIT3_UPLOAD_CONCURRENCY" {
+			c.UploadConcurrency = i
+		} else if k == "GIT3_DOWNLOAD_CONCURRENCY" {
 			c.DownloadConcurrency = i
 		} else if k == "GIT3_MAX_ATTEMPTS" {
 			c.MaxAttempts = i
@@ -242,7 +214,7 @@ func (c Config) Validate() error {
 	if c.PartSize > 5<<30 || c.MultipartThreshold < 0 || c.MultipartThreshold > 1<<40 || c.DownloadChunkSize < 1<<20 || c.DownloadChunkSize > 5<<30 || c.CompactAfterBytes < 1 || c.CompactAfterBytes > 1<<40 {
 		return fmt.Errorf("byte setting outside supported bounds")
 	}
-	if c.DownloadConcurrency < 1 || c.DownloadConcurrency > 64 || c.MaxAttempts < 1 || c.MaxAttempts > 20 || c.CompactionFanout < 2 || c.CompactionFanout > 1024 || c.CompactAfterTransactions < 1 || c.CompactAfterTransactions > 100000 {
+	if c.UploadConcurrency < 1 || c.UploadConcurrency > 16 || c.DownloadConcurrency < 1 || c.DownloadConcurrency > 64 || c.MaxAttempts < 1 || c.MaxAttempts > 20 || c.CompactionFanout < 2 || c.CompactionFanout > 1024 || c.CompactAfterTransactions < 1 || c.CompactAfterTransactions > 100000 {
 		return fmt.Errorf("integer setting outside supported bounds")
 	}
 	if c.Endpoint != "" {

@@ -22,7 +22,7 @@ func TestSHA256RepositoryRoundTrip(t *testing.T) {
 	oid := run(t, src, "rev-parse", "HEAD")
 	mem := store.NewMemory()
 	w := &Repository{Store: mem, Git: gitx.Git{Dir: src}, Version: "test"}
-	if _, e := w.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &oid}}, true); e != nil {
+	if _, e := w.Push(ctx, nil, []PushCommand{{Dst: "refs/heads/main", NewOID: &oid}}, PushOptions{Atomic: true}); e != nil {
 		t.Fatal(e)
 	}
 	dst := t.TempDir()
@@ -35,7 +35,7 @@ func TestSHA256RepositoryRoundTrip(t *testing.T) {
 	if s.Head.ObjectFormat != "sha256" {
 		t.Fatal("remote format mismatch")
 	}
-	if e = r.Fetch(ctx, s, []string{oid}, true); e != nil {
+	if _, e = r.Fetch(ctx, advertisement(s), []string{oid}, FetchOptions{}); e != nil {
 		t.Fatal(e)
 	}
 	if !r.Git.HasObject(ctx, oid) {

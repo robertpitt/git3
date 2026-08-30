@@ -95,15 +95,8 @@ func (r *Repository) Fsck(ctx context.Context, full bool) error {
 	if e = r.verifyDescriptorGraph(ctx, s); e != nil {
 		return e
 	}
-	b, e := r.verified(ctx, s.Head.Packset.Object, model.MaxPackset)
+	ps, e := r.loadPackset(ctx, s)
 	if e != nil {
-		return e
-	}
-	var ps model.Packset
-	if e = canonical.UnmarshalForward(b, &ps, model.MaxPackset); e != nil {
-		return e
-	}
-	if e = ps.Validate(); e != nil {
 		return e
 	}
 	for _, l := range ps.Levels {
@@ -136,11 +129,14 @@ func (r *Repository) Fsck(ctx context.Context, full bool) error {
 		for _, oid := range s.Refs {
 			tips = append(tips, oid)
 		}
-		return vr.Fetch(ctx, s, tips, true)
+		return vr.fetchState(ctx, s, tips, &FetchReport{}, nil)
 	}
 	return nil
 }
 func (r *Repository) verifyDescriptorGraph(ctx context.Context, s *RemoteState) error {
+	if !s.logResolved {
+		return fmt.Errorf("descriptor verification requires a resolved log")
+	}
 	check := func(x model.Envelope) error {
 		d, e := r.verified(ctx, x.Descriptor, model.MaxTransaction)
 		if e != nil {
@@ -155,37 +151,10 @@ func (r *Repository) verifyDescriptorGraph(ctx context.Context, s *RemoteState) 
 		}
 		return nil
 	}
-	for _, x := range s.Head.Log.Tail {
+	for _, x := range s.logEnvelopes {
 		if e := check(x); e != nil {
 			return e
 		}
-	}
-	p := s.Head.Log.TipPage
-	seen := map[string]bool{}
-	for p != nil && p.LastGeneration > s.Head.Log.FloorGeneration {
-		if seen[p.PageID] {
-			return fmt.Errorf("page cycle")
-		}
-		seen[p.PageID] = true
-		b, e := r.verified(ctx, p.Object, model.MaxLogPage)
-		if e != nil {
-			return e
-		}
-		var pg model.LogPage
-		if e = canonical.UnmarshalForward(b, &pg, model.MaxLogPage); e != nil {
-			return e
-		}
-		for _, x := range pg.Transactions {
-			if x.Transaction.Generation > s.Head.Log.FloorGeneration {
-				if e = check(x); e != nil {
-					return e
-				}
-			}
-		}
-		if pg.Previous == nil {
-			break
-		}
-		p = &model.PagePointer{PageID: pg.Previous.PageID, FirstGeneration: pg.Previous.FirstGeneration, LastGeneration: pg.Previous.LastGeneration, Object: pg.Previous.Object}
 	}
 	return nil
 }
@@ -220,12 +189,10 @@ func (r *Repository) uploadFile(ctx context.Context, key, path string) (model.Ob
 				if z >= n {
 					z = n - 1
 				}
-				part, x := r.Store.GetRange(ctx, key, a, z)
-				if x != nil {
+				if x := r.copyRange(ctx, key, a, z, uint64(n), h); x != nil {
 					ge = x
 					break
 				}
-				h.Write(part)
 				a = z + 1
 			}
 		}
@@ -262,8 +229,15 @@ func refsAtFloor(s *RemoteState) map[string]string {
 	return refs
 }
 
+// MaintenanceOptions controls one bounded maintenance operation.
+type MaintenanceOptions struct {
+	Fanout   int
+	MaxBytes int64
+}
+
 // Maintenance compacts live objects using a geometric fanout policy.
-func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error) {
+func (r *Repository) Maintenance(ctx context.Context, options MaintenanceOptions) (string, error) {
+	fanout := options.Fanout
 	if e := r.Git.RequireVersion(ctx, 2, 38); e != nil {
 		return "", e
 	}
@@ -272,7 +246,7 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 		return "", e
 	}
 	if s.Head.GCBarrier != nil {
-		return "", fmt.Errorf("GC barrier active")
+		return "", errs.E(errs.GCBarrierActive, "maintenance", fmt.Errorf("GC barrier active"))
 	}
 	if e = r.ensureWritePolicy(s); e != nil {
 		return "", e
@@ -292,19 +266,9 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 	if e = r.Git.VerifyConnectivity(ctx, s.Refs); e != nil {
 		return "", e
 	}
-	pb, e := r.verified(ctx, s.Head.Packset.Object, model.MaxPackset)
+	old, e := r.loadPackset(ctx, s)
 	if e != nil {
 		return "", e
-	}
-	var old model.Packset
-	if e = canonical.UnmarshalForward(pb, &old, model.MaxPackset); e != nil {
-		return "", e
-	}
-	if e = old.Validate(); e != nil {
-		return "", e
-	}
-	if old.RepositoryID != s.Head.RepositoryID || old.PacksetID != s.Head.Packset.PacksetID || old.Generation != s.Head.Packset.Generation || !same(old.TransactionID, s.Head.Packset.TransactionID) {
-		return "", fmt.Errorf("packset pointer mismatch")
 	}
 	if s.Head.Packset.Generation == s.Head.LogicalGeneration && s.Head.RefSnapshot.Generation == s.Head.LogicalGeneration {
 		return s.Head.PublicationID, nil
@@ -312,7 +276,7 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 	targetGen := s.Head.LogicalGeneration
 	targetTx := s.Head.TransactionID
 	targetRefs := s.Refs
-	if r.MaintenanceMaxBytes > 0 {
+	if options.MaxBytes > 0 {
 		refs := refsAtFloor(s)
 		targetGen = s.Head.Packset.Generation
 		targetTx = s.Head.Packset.TransactionID
@@ -325,7 +289,7 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 			if tx.ObjectData != nil {
 				n = tx.ObjectData.Object.Size
 			}
-			if used+n > uint64(r.MaintenanceMaxBytes) {
+			if used+n > uint64(options.MaxBytes) {
 				break
 			}
 			if e = model.Apply(refs, []model.Transaction{tx}); e != nil {
@@ -406,7 +370,7 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 				pp := filepath.Join(ls.PackDir, "pack-"+p.GitPackChecksum+".pack")
 				ip := filepath.Join(ls.PackDir, "pack-"+p.GitPackChecksum+".idx")
 				if _, er := os.Stat(pp); er != nil {
-					if er = r.downloadVerified(ctx, p.Pack, pp+".part"); er != nil {
+					if er = r.downloadVerified(ctx, p.Pack, pp+".part", nil); er != nil {
 						return "", er
 					}
 					if er = os.Rename(pp+".part", pp); er != nil {
@@ -416,7 +380,7 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 					return "", fmt.Errorf("selected local pack failed verification")
 				}
 				if _, er := os.Stat(ip); er != nil {
-					if er = r.downloadVerified(ctx, p.Index, ip+".part"); er != nil {
+					if er = r.downloadVerified(ctx, p.Index, ip+".part", nil); er != nil {
 						return "", er
 					}
 					if er = os.Rename(ip+".part", ip); er != nil {
@@ -505,34 +469,21 @@ func (r *Repository) Maintenance(ctx context.Context, fanout int) (string, error
 	}
 	h.ManifestRevision++
 	h.PublicationID = uuid.NewString()
-	if e = h.Validate(); e != nil {
-		return "", e
-	}
 	if e = r.validateBootstrap(ctx, h, s.Transactions, s.Refs); e != nil {
 		return "", e
 	}
-	hb, e := canonical.Marshal(h)
+	e = r.publishHead(ctx, h, headPublication{
+		operation:    "maintenance",
+		expectedETag: s.ETag,
+		conflict:     "another publisher replaced HEAD",
+		confirm: func(observed *RemoteState, _ error) (bool, error) {
+			return observed.Head.Packset.PacksetID == packID, nil
+		},
+	})
 	if e != nil {
 		return "", e
 	}
-	if len(hb) > model.MaxHead {
-		return "", fmt.Errorf("prospective HEAD exceeds limit")
-	}
-	_, e = r.Store.Put(ctx, ".git/git3/HEAD", bytes.NewReader(hb), int64(len(hb)), store.PutOptions{IfMatch: s.ETag})
-	if errors.Is(e, store.ErrPrecondition) {
-		return "", errs.E(errs.CASConflict, "maintenance", fmt.Errorf("another publisher replaced HEAD"))
-	}
-	if e != nil {
-		observed, re := r.ReadUnconditional(ctx)
-		if re != nil {
-			return "", errs.E(errs.PublishAmbiguous, "maintenance", e)
-		}
-		if observed.Head.PublicationID == h.PublicationID || observed.Head.Packset.PacksetID == packID {
-			return h.PublicationID, nil
-		}
-		return "", errs.E(errs.PublishAmbiguous, "maintenance", e)
-	}
-	return h.PublicationID, e
+	return h.PublicationID, nil
 }
 
 // SetHead atomically changes the remote symbolic HEAD.
@@ -554,28 +505,11 @@ func (r *Repository) SetHead(ctx context.Context, ref string) (string, error) {
 	h.HeadSymref = &ref
 	h.ManifestRevision++
 	h.PublicationID = uuid.NewString()
-	if e = h.Validate(); e != nil {
-		return "", e
-	}
-	b, e := canonical.Marshal(h)
+	e = r.publishHead(ctx, h, headPublication{operation: "set-head", expectedETag: s.ETag, conflict: "another publisher replaced HEAD"})
 	if e != nil {
 		return "", e
 	}
-	_, e = r.Store.Put(ctx, ".git/git3/HEAD", bytes.NewReader(b), int64(len(b)), store.PutOptions{IfMatch: s.ETag})
-	if errors.Is(e, store.ErrPrecondition) {
-		return "", errs.E(errs.CASConflict, "set-head", fmt.Errorf("another publisher replaced HEAD"))
-	}
-	if e != nil {
-		observed, re := r.ReadUnconditional(ctx)
-		if re != nil {
-			return "", errs.E(errs.PublishAmbiguous, "set-head", e)
-		}
-		if observed.Head.PublicationID == h.PublicationID {
-			return h.PublicationID, nil
-		}
-		return "", errs.E(errs.PublishAmbiguous, "set-head", e)
-	}
-	return h.PublicationID, e
+	return h.PublicationID, nil
 }
 
 // GCReport summarizes candidates discovered by garbage collection.
@@ -589,13 +523,12 @@ type GCReport struct {
 }
 
 func (r *Repository) liveKeys(ctx context.Context, s *RemoteState) (map[string]bool, error) {
-	live := map[string]bool{".git/git3/HEAD": true, s.Head.RefSnapshot.Object.Key: true, s.Head.Packset.Object.Key: true}
-	pb, e := r.verified(ctx, s.Head.Packset.Object, model.MaxPackset)
-	if e != nil {
-		return nil, e
+	if !s.logResolved {
+		return nil, fmt.Errorf("live-key discovery requires a resolved log")
 	}
-	var ps model.Packset
-	if e = canonical.UnmarshalForward(pb, &ps, model.MaxPackset); e != nil {
+	live := map[string]bool{".git/git3/HEAD": true, s.Head.RefSnapshot.Object.Key: true, s.Head.Packset.Object.Key: true}
+	ps, e := r.loadPackset(ctx, s)
+	if e != nil {
 		return nil, e
 	}
 	for _, l := range ps.Levels {
@@ -604,40 +537,14 @@ func (r *Repository) liveKeys(ctx context.Context, s *RemoteState) (map[string]b
 			live[p.Index.Key] = true
 		}
 	}
-	for _, e := range s.Head.Log.Tail {
+	for _, page := range s.logPages {
+		live[page.Key] = true
+	}
+	for _, e := range s.logEnvelopes {
 		live[e.Descriptor.Key] = true
 		if e.Transaction.ObjectData != nil {
 			live[e.Transaction.ObjectData.Object.Key] = true
 		}
-	}
-	p := s.Head.Log.TipPage
-	seen := map[string]bool{}
-	for p != nil && p.LastGeneration > s.Head.Log.FloorGeneration {
-		if seen[p.PageID] {
-			return nil, fmt.Errorf("page cycle")
-		}
-		seen[p.PageID] = true
-		live[p.Object.Key] = true
-		b, e := r.verified(ctx, p.Object, model.MaxLogPage)
-		if e != nil {
-			return nil, e
-		}
-		var pg model.LogPage
-		if e = canonical.UnmarshalForward(b, &pg, model.MaxLogPage); e != nil {
-			return nil, e
-		}
-		for _, x := range pg.Transactions {
-			if x.Transaction.Generation > s.Head.Log.FloorGeneration {
-				live[x.Descriptor.Key] = true
-				if x.Transaction.ObjectData != nil {
-					live[x.Transaction.ObjectData.Object.Key] = true
-				}
-			}
-		}
-		if pg.Previous == nil {
-			break
-		}
-		p = &model.PagePointer{PageID: pg.Previous.PageID, FirstGeneration: pg.Previous.FirstGeneration, LastGeneration: pg.Previous.LastGeneration, Object: pg.Previous.Object}
 	}
 	if s.Head.GCBarrier != nil {
 		live[s.Head.GCBarrier.Plan.Key] = true
@@ -647,32 +554,43 @@ func (r *Repository) liveKeys(ctx context.Context, s *RemoteState) (map[string]b
 
 // GCDryRun discovers unreachable objects without changing remote state.
 func (r *Repository) GCDryRun(ctx context.Context, cutoff time.Time) (GCReport, error) {
-	s, e := r.Read(ctx)
+	report, _, e := r.gcDryRun(ctx, cutoff)
+	return report, e
+}
+
+func (r *Repository) gcDryRun(ctx context.Context, cutoff time.Time) (GCReport, *RemoteState, error) {
+	s, e := r.ReadUnconditional(ctx)
 	if e != nil {
-		return GCReport{}, e
+		return GCReport{}, nil, e
 	}
 	live, e := r.liveKeys(ctx, s)
 	if e != nil {
-		return GCReport{}, e
-	}
-	all, e := r.Store.List(ctx, ".git/git3/")
-	if e != nil {
-		return GCReport{}, e
+		return GCReport{}, nil, e
 	}
 	rep := GCReport{RepositoryID: s.Head.RepositoryID, PublicationID: s.Head.PublicationID, ETag: s.ETag, Cutoff: cutoff.UTC().Format(time.RFC3339)}
-	for _, x := range all {
+	e = r.Store.Walk(ctx, ".git/git3/", func(x store.Metadata) error {
 		if e := locator.ValidateManagedKey(x.Key); e != nil {
-			return GCReport{}, e
+			return e
+		}
+		if x.Size < 0 {
+			return fmt.Errorf("negative object size for %s", x.Key)
 		}
 		if live[x.Key] || x.Key == ".git/git3/HEAD" || strings.HasPrefix(x.Key, ".git/git3/probes/") || !x.LastModified.Before(cutoff) {
-			continue
+			return nil
+		}
+		if len(rep.Candidates) == model.MaxRefs {
+			return fmt.Errorf("GC candidate set exceeds %d; execute separately barriered plans", model.MaxRefs)
 		}
 		c := model.GCCandidate{Key: x.Key, Size: uint64(x.Size), ETag: x.ETag, LastModified: x.LastModified.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z"), Category: gcCategory(x.Key)}
 		rep.Candidates = append(rep.Candidates, c)
 		rep.TotalBytes += uint64(x.Size)
+		return nil
+	})
+	if e != nil {
+		return GCReport{}, nil, e
 	}
 	sort.Slice(rep.Candidates, func(i, j int) bool { return rep.Candidates[i].Key < rep.Candidates[j].Key })
-	return rep, nil
+	return rep, s, nil
 }
 func gcCategory(k string) string {
 	p := strings.TrimPrefix(k, ".git/git3/")
@@ -682,21 +600,68 @@ func gcCategory(k string) string {
 	return p
 }
 
+func (r *Repository) validateGCCandidates(ctx context.Context, s *RemoteState, candidates []model.GCCandidate, allowMissing bool) error {
+	live, e := r.liveKeys(ctx, s)
+	if e != nil {
+		return e
+	}
+	for _, candidate := range candidates {
+		if live[candidate.Key] {
+			return fmt.Errorf("candidate became live: %s", candidate.Key)
+		}
+		metadata, e := r.Store.Head(ctx, candidate.Key)
+		if allowMissing && errors.Is(e, store.ErrNotFound) {
+			continue
+		}
+		if e != nil {
+			return e
+		}
+		modified := metadata.LastModified.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		if metadata.Size < 0 || metadata.ETag != candidate.ETag || uint64(metadata.Size) != candidate.Size || modified != candidate.LastModified {
+			return fmt.Errorf("candidate changed: %s", candidate.Key)
+		}
+	}
+	return nil
+}
+
+func (r *Repository) deleteGCCandidates(ctx context.Context, candidates []model.GCCandidate, allowMissing bool) error {
+	for _, candidate := range candidates {
+		e := r.Store.Delete(ctx, candidate.Key, store.DeleteOptions{IfMatch: candidate.ETag})
+		if allowMissing && errors.Is(e, store.ErrNotFound) {
+			continue
+		}
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func (r *Repository) clearGCBarrier(ctx context.Context, s *RemoteState, id, operation string) (string, error) {
+	if s.Head.GCBarrier == nil || s.Head.GCBarrier.PlanID != id {
+		return "", fmt.Errorf("GC plan is not active")
+	}
+	h := s.Head
+	h.GCBarrier = nil
+	h.ManifestRevision++
+	h.PublicationID = uuid.NewString()
+	if e := r.publishHead(ctx, h, headPublication{operation: operation, expectedETag: s.ETag, conflict: "GC barrier changed"}); e != nil {
+		return "", e
+	}
+	return h.PublicationID, nil
+}
+
 // GCExecute publishes a barrier and conditionally deletes planned candidates.
 func (r *Repository) GCExecute(ctx context.Context, cutoff time.Time) (string, error) {
-	rep, e := r.GCDryRun(ctx, cutoff)
+	rep, s, e := r.gcDryRun(ctx, cutoff)
 	if e != nil {
 		return "", e
 	}
-	s := r.Pinned
 	if e = r.ensureWritePolicy(s); e != nil {
 		return "", e
 	}
 	if s.Head.GCBarrier != nil {
-		return "", fmt.Errorf("GC barrier active")
-	}
-	if len(rep.Candidates) > model.MaxRefs {
-		return "", fmt.Errorf("GC candidate set exceeds %d; execute separately barriered plans", model.MaxRefs)
+		return "", errs.E(errs.GCBarrierActive, "gc", fmt.Errorf("GC barrier active"))
 	}
 	id := uuid.NewString()
 	plan := model.GCPlan{FormatVersion: 1, PlanID: id, RepositoryID: rep.RepositoryID, SourcePublicationID: rep.PublicationID, SourceETag: rep.ETag, Cutoff: rep.Cutoff, Candidates: rep.Candidates}
@@ -715,65 +680,31 @@ func (r *Repository) GCExecute(ctx context.Context, cutoff time.Time) (string, e
 	h.GCBarrier = &model.GCBarrier{PlanID: id, CreatedAt: time.Now().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z"), Plan: pr}
 	h.ManifestRevision++
 	h.PublicationID = uuid.NewString()
-	if e = h.Validate(); e != nil {
-		return "", e
-	}
-	hb, e := canonical.Marshal(h)
+	e = r.publishHead(ctx, h, headPublication{
+		operation:    "gc-start",
+		expectedETag: s.ETag,
+		conflict:     "another publisher replaced HEAD",
+		confirm: func(observed *RemoteState, _ error) (bool, error) {
+			return observed.Head.GCBarrier != nil && observed.Head.GCBarrier.PlanID == id, nil
+		},
+	})
 	if e != nil {
 		return "", e
 	}
-	_, e = r.Store.Put(ctx, ".git/git3/HEAD", bytes.NewReader(hb), int64(len(hb)), store.PutOptions{IfMatch: s.ETag})
-	if e != nil {
-		return "", e
-	}
-	s, e = r.Read(ctx)
+	s, e = r.ReadUnconditional(ctx)
 	if e != nil {
 		return "", e
 	}
 	if s.Head.GCBarrier == nil || s.Head.GCBarrier.PlanID != id {
 		return "", fmt.Errorf("GC barrier changed")
 	}
-	live, e := r.liveKeys(ctx, s)
-	if e != nil {
+	if e = r.validateGCCandidates(ctx, s, plan.Candidates, false); e != nil {
 		return "", e
 	}
-	for _, c := range plan.Candidates {
-		if live[c.Key] {
-			return "", fmt.Errorf("candidate became live: %s", c.Key)
-		}
-		md, e := r.Store.Head(ctx, c.Key)
-		if e != nil {
-			return "", e
-		}
-		if md.ETag != c.ETag || uint64(md.Size) != c.Size || md.LastModified.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z") != c.LastModified {
-			return "", fmt.Errorf("candidate changed: %s", c.Key)
-		}
-	}
-	for _, c := range plan.Candidates {
-		if e = r.Store.Delete(ctx, c.Key, store.DeleteOptions{IfMatch: c.ETag}); e != nil {
-			return "", e
-		}
-	}
-	s, e = r.Read(ctx)
-	if e != nil {
+	if e = r.deleteGCCandidates(ctx, plan.Candidates, false); e != nil {
 		return "", e
 	}
-	h = s.Head
-	if h.GCBarrier == nil || h.GCBarrier.PlanID != id {
-		return "", fmt.Errorf("GC barrier changed")
-	}
-	h.GCBarrier = nil
-	h.ManifestRevision++
-	h.PublicationID = uuid.NewString()
-	if e = h.Validate(); e != nil {
-		return "", e
-	}
-	hb, e = canonical.Marshal(h)
-	if e != nil {
-		return "", e
-	}
-	_, e = r.Store.Put(ctx, ".git/git3/HEAD", bytes.NewReader(hb), int64(len(hb)), store.PutOptions{IfMatch: s.ETag})
-	return h.PublicationID, e
+	return r.clearGCBarrier(ctx, s, id, "gc-finish")
 }
 
 // GCAbort clears the identified garbage-collection barrier without deleting candidates.
@@ -785,27 +716,12 @@ func (r *Repository) GCAbort(ctx context.Context, id string) (string, error) {
 	if e = r.ensureWritePolicy(s); e != nil {
 		return "", e
 	}
-	if s.Head.GCBarrier == nil || s.Head.GCBarrier.PlanID != id {
-		return "", fmt.Errorf("GC plan is not active")
-	}
-	h := s.Head
-	h.GCBarrier = nil
-	h.ManifestRevision++
-	h.PublicationID = uuid.NewString()
-	if e = h.Validate(); e != nil {
-		return "", e
-	}
-	b, e := canonical.Marshal(h)
-	if e != nil {
-		return "", e
-	}
-	_, e = r.Store.Put(ctx, ".git/git3/HEAD", bytes.NewReader(b), int64(len(b)), store.PutOptions{IfMatch: s.ETag})
-	return h.PublicationID, e
+	return r.clearGCBarrier(ctx, s, id, "gc-abort")
 }
 
 // GCResume continues deletion for the identified garbage-collection plan.
 func (r *Repository) GCResume(ctx context.Context, id string) (string, error) {
-	s, e := r.Read(ctx)
+	s, e := r.ReadUnconditional(ctx)
 	if e != nil {
 		return "", e
 	}
@@ -829,35 +745,13 @@ func (r *Repository) GCResume(ctx context.Context, id string) (string, error) {
 	if e = p.Validate(); e != nil {
 		return "", e
 	}
-	live, e := r.liveKeys(ctx, s)
-	if e != nil {
+	if e = r.validateGCCandidates(ctx, s, p.Candidates, true); e != nil {
 		return "", e
 	}
-	for _, c := range p.Candidates {
-		if live[c.Key] {
-			return "", fmt.Errorf("candidate became live: %s", c.Key)
-		}
-		m, e := r.Store.Head(ctx, c.Key)
-		if errors.Is(e, store.ErrNotFound) {
-			continue
-		}
-		if e != nil {
-			return "", e
-		}
-		if m.ETag != c.ETag || uint64(m.Size) != c.Size || m.LastModified.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z") != c.LastModified {
-			return "", fmt.Errorf("candidate changed: %s", c.Key)
-		}
+	if e = r.deleteGCCandidates(ctx, p.Candidates, true); e != nil {
+		return "", e
 	}
-	for _, c := range p.Candidates {
-		e = r.Store.Delete(ctx, c.Key, store.DeleteOptions{IfMatch: c.ETag})
-		if errors.Is(e, store.ErrNotFound) {
-			continue
-		}
-		if e != nil {
-			return "", e
-		}
-	}
-	return r.GCAbort(ctx, id)
+	return r.clearGCBarrier(ctx, s, id, "gc-resume")
 }
 
 // Probe checks that the configured object-store location is reachable.

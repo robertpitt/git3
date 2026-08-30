@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -11,6 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/robertpitt/git3/internal/locator"
 )
+
+// ErrFormatUnsupported marks protocol features this implementation cannot read.
+var ErrFormatUnsupported = errors.New("format unsupported")
 
 // Format and document-size limits for the remote protocol.
 const (
@@ -302,19 +306,19 @@ func validRefBasic(s string) bool {
 // Validate checks HEAD invariants without fetching referenced objects.
 func (h *Head) Validate() error {
 	if h.FormatVersion != 1 {
-		return fmt.Errorf("unsupported formatVersion %d", h.FormatVersion)
+		return fmt.Errorf("%w: formatVersion %d", ErrFormatUnsupported, h.FormatVersion)
 	}
 	if h.RequiredFeatures == nil {
 		return fmt.Errorf("requiredFeatures must not be null")
 	}
 	if len(h.RequiredFeatures) > 0 {
-		return fmt.Errorf("unsupported required feature %q", h.RequiredFeatures[0])
+		return fmt.Errorf("%w: required feature %q", ErrFormatUnsupported, h.RequiredFeatures[0])
 	}
 	if !validUUID(h.RepositoryID) || !validUUID(h.PublicationID) {
 		return fmt.Errorf("invalid repository/publication UUID")
 	}
 	if h.ObjectFormat != "sha1" && h.ObjectFormat != "sha256" {
-		return fmt.Errorf("unsupported object format")
+		return fmt.Errorf("%w: object format %q", ErrFormatUnsupported, h.ObjectFormat)
 	}
 	if h.ManifestRevision < 1 {
 		return fmt.Errorf("manifest revision must be positive")

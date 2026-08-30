@@ -64,6 +64,10 @@ git push -u origin HEAD:refs/heads/main
 
 Signed commits and tags are preserved. Both SHA-1 and SHA-256 repositories are supported.
 
+Interactive clone, fetch, and push operations report native Git packing/indexing progress together
+with S3 pack-transfer and publication phases. Git's `--quiet` option suppresses this progress while
+warnings and errors continue to use stderr.
+
 After a clone or fetch, the local repository contains native Git packs. Remove git3 and normal
 local commands such as `log`, `checkout`, `fsck`, and `repack` still work.
 

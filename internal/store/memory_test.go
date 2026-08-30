@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -25,11 +26,16 @@ func TestMemoryStoreContract(t *testing.T) {
 	if _, err = store.Get(ctx, "objects/a", metadata.ETag); !errors.Is(err, ErrNotModified) {
 		t.Fatalf("conditional get = %v", err)
 	}
-	part, err := store.GetRange(ctx, "objects/a", 1, 3)
-	if err != nil || string(part) != "bcd" {
-		t.Fatalf("range = %q, %v", part, err)
+	part, err := store.OpenRange(ctx, "objects/a", 1, 3)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err = store.GetRange(ctx, "objects/a", 3, 9); err == nil {
+	partBody, err := io.ReadAll(part.Body)
+	_ = part.Body.Close()
+	if err != nil || string(partBody) != "bcd" || part.Size != 3 || part.TotalSize != 6 {
+		t.Fatalf("range = %q size=%d total=%d, %v", partBody, part.Size, part.TotalSize, err)
+	}
+	if _, err = store.OpenRange(ctx, "objects/a", 3, 9); err == nil {
 		t.Fatal("accepted invalid range")
 	}
 	head, err := store.Head(ctx, "objects/a")
@@ -37,7 +43,11 @@ func TestMemoryStoreContract(t *testing.T) {
 		t.Fatalf("head = %#v, %v", head, err)
 	}
 	store.Set("objects/b", []byte("b"))
-	listed, err := store.List(ctx, "objects/")
+	var listed []Metadata
+	err = store.Walk(ctx, "objects/", func(metadata Metadata) error {
+		listed = append(listed, metadata)
+		return nil
+	})
 	if err != nil || len(listed) != 2 || listed[0].Key != "objects/a" || listed[1].Key != "objects/b" {
 		t.Fatalf("list = %#v, %v", listed, err)
 	}

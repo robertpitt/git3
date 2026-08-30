@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/robertpitt/git3/internal/errs"
 )
 
 // Git runs native Git commands in Dir.
@@ -59,7 +63,11 @@ func (g Git) Run(ctx context.Context, args ...string) ([]byte, error) {
 	c.Stderr = &errb
 	out, e := c.Output()
 	if e != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), e, strings.TrimSpace(errb.String()))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		detail := fmt.Errorf("%w: %s", e, strings.TrimSpace(errb.String()))
+		return nil, errs.E(errs.LocalGitFailed, "git "+strings.Join(args, " "), detail)
 	}
 	return out, nil
 }
@@ -110,14 +118,82 @@ func (g Git) Resolve(ctx context.Context, rev string) (string, error) {
 	return strings.TrimSpace(string(b)), e
 }
 
+// ExistingObjects reports which object IDs exist locally using one Git process.
+func (g Git) ExistingObjects(ctx context.Context, oids []string) (map[string]bool, error) {
+	existing := make(map[string]bool, len(oids))
+	if len(oids) == 0 {
+		return existing, nil
+	}
+	unique := make([]string, 0, len(oids))
+	seen := make(map[string]struct{}, len(oids))
+	for _, oid := range oids {
+		if _, ok := seen[oid]; ok {
+			continue
+		}
+		seen[oid] = struct{}{}
+		unique = append(unique, oid)
+	}
+	var input strings.Builder
+	for _, oid := range unique {
+		fmt.Fprintln(&input, oid)
+	}
+	c := g.cmd(ctx, "cat-file", "--batch-check=%(objectname)")
+	c.Stdin = strings.NewReader(input.String())
+	var out, errb bytes.Buffer
+	c.Stdout = &out
+	c.Stderr = &errb
+	if e := c.Run(); e != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, errs.E(errs.LocalGitFailed, "git cat-file --batch-check", fmt.Errorf("%w: %s", e, strings.TrimSpace(errb.String())))
+	}
+	sc := bufio.NewScanner(&out)
+	for _, oid := range unique {
+		if !sc.Scan() {
+			if e := sc.Err(); e != nil {
+				return nil, e
+			}
+			return nil, fmt.Errorf("git cat-file returned too few results")
+		}
+		line := sc.Text()
+		if line == oid {
+			existing[oid] = true
+			continue
+		}
+		if line != oid+" missing" {
+			return nil, fmt.Errorf("unexpected git cat-file result %q", line)
+		}
+	}
+	if sc.Scan() {
+		return nil, fmt.Errorf("git cat-file returned too many results")
+	}
+	if e := sc.Err(); e != nil {
+		return nil, e
+	}
+	return existing, nil
+}
+
 // HasObject reports whether oid exists locally.
 func (g Git) HasObject(ctx context.Context, oid string) bool {
-	return g.cmd(ctx, "cat-file", "-e", oid+"^{object}").Run() == nil
+	existing, e := g.ExistingObjects(ctx, []string{oid})
+	return e == nil && existing[oid]
 }
 
 // IsAncestor reports whether old is an ancestor of new.
-func (g Git) IsAncestor(ctx context.Context, old, new string) bool {
-	return g.cmd(ctx, "merge-base", "--is-ancestor", old, new).Run() == nil
+func (g Git) IsAncestor(ctx context.Context, old, new string) (bool, error) {
+	e := g.cmd(ctx, "merge-base", "--is-ancestor", old, new).Run()
+	if e == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(e, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	return false, errs.E(errs.LocalGitFailed, "git merge-base --is-ancestor", e)
 }
 
 // CheckRef validates a ref name using Git's own rules.
@@ -152,12 +228,15 @@ func (g Git) VerifyConnectivity(ctx context.Context, refs map[string]string) err
 	}
 	_ = in.Close()
 	if e = c.Wait(); e != nil {
-		return fmt.Errorf("connectivity: %w: %s", e, errb.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return errs.E(errs.LocalGitFailed, "git connectivity", fmt.Errorf("%w: %s", e, errb.String()))
 	}
 	sc := bufio.NewScanner(&out)
 	for sc.Scan() {
 		if strings.HasPrefix(sc.Text(), "?") {
-			return fmt.Errorf("missing object %s", strings.TrimPrefix(sc.Text(), "?"))
+			return errs.E(errs.IntegrityFailed, "git connectivity", fmt.Errorf("missing object %s", strings.TrimPrefix(sc.Text(), "?")))
 		}
 	}
 	return sc.Err()
@@ -174,16 +253,19 @@ type ProcessReader struct {
 func (p *ProcessReader) Wait() error {
 	e := p.cmd.Wait()
 	if e != nil {
-		return fmt.Errorf("git pack-objects: %w: %s", e, p.stderr.String())
+		return errs.E(errs.LocalGitFailed, "git pack-objects", fmt.Errorf("%w: %s", e, p.stderr.String()))
 	}
 	return nil
 }
 
 // PackObjects streams a pack for the positive revisions excluding negative revisions.
-func (g Git) PackObjects(ctx context.Context, positive, negative []string, thin bool) (*ProcessReader, error) {
+func (g Git) PackObjects(ctx context.Context, positive, negative []string, thin bool, progress io.Writer) (*ProcessReader, error) {
 	args := []string{"pack-objects", "--revs", "--stdout"}
 	if thin {
 		args = append(args, "--thin")
+	}
+	if progress != nil {
+		args = append(args, "--progress", "--all-progress-implied")
 	}
 	c := g.cmd(ctx, args...)
 	in, e := c.StdinPipe()
@@ -196,6 +278,9 @@ func (g Git) PackObjects(ctx context.Context, positive, negative []string, thin 
 	}
 	errb := new(bytes.Buffer)
 	c.Stderr = errb
+	if progress != nil {
+		c.Stderr = io.MultiWriter(errb, progress)
+	}
 	if e = c.Start(); e != nil {
 		return nil, e
 	}
@@ -212,7 +297,7 @@ func (g Git) PackObjects(ctx context.Context, positive, negative []string, thin 
 }
 
 // IndexPack installs a streamed pack and returns its pack checksum.
-func (g Git) IndexPack(ctx context.Context, r io.Reader, fixThin bool, keep string) (string, error) {
+func (g Git) IndexPack(ctx context.Context, r io.Reader, fixThin bool, keep string, progress io.Writer) (string, error) {
 	args := []string{"index-pack", "--stdin", "--strict"}
 	if fixThin {
 		args = append(args, "--fix-thin")
@@ -220,13 +305,22 @@ func (g Git) IndexPack(ctx context.Context, r io.Reader, fixThin bool, keep stri
 	if keep != "" {
 		args = append(args, "--keep="+keep)
 	}
+	if progress != nil {
+		args = append(args, "-v")
+	}
 	c := g.cmd(ctx, args...)
 	c.Stdin = r
 	var out, errb bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &errb
+	if progress != nil {
+		c.Stderr = io.MultiWriter(&errb, progress)
+	}
 	if e := c.Run(); e != nil {
-		return "", fmt.Errorf("index-pack: %w: %s", e, errb.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", errs.E(errs.LocalGitFailed, "git index-pack", fmt.Errorf("%w: %s", e, errb.String()))
 	}
 	return strings.TrimSpace(out.String()), nil
 }
@@ -239,7 +333,7 @@ func (g Git) IndexPackFile(ctx context.Context, pack string) error {
 
 // VerifyPack checks the pack referenced by index.
 func (g Git) VerifyPack(ctx context.Context, index string) error {
-	_, e := g.Run(ctx, "verify-pack", "-v", index)
+	_, e := g.Run(ctx, "verify-pack", index)
 	return e
 }
 
@@ -250,34 +344,28 @@ func (g Git) CountPackObjects(ctx context.Context, index string) (uint64, error)
 		return 0, e
 	}
 	defer f.Close()
-	c := g.cmd(ctx, "show-index")
-	c.Stdin = f
-	out, e := c.StdoutPipe()
-	if e != nil {
-		return 0, e
+	header := make([]byte, 8)
+	if _, e = io.ReadFull(f, header); e != nil {
+		return 0, fmt.Errorf("read pack index header: %w", e)
 	}
-	var errb bytes.Buffer
-	c.Stderr = &errb
-	if e = c.Start(); e != nil {
-		return 0, e
+	offset := int64(255 * 4)
+	if bytes.Equal(header[:4], []byte{0xff, 't', 'O', 'c'}) {
+		if version := binary.BigEndian.Uint32(header[4:]); version != 2 {
+			return 0, fmt.Errorf("unsupported pack index version %d", version)
+		}
+		offset += 8
 	}
-	var n uint64
-	sc := bufio.NewScanner(out)
-	for sc.Scan() {
-		n++
+	var count [4]byte
+	if _, e = f.ReadAt(count[:], offset); e != nil {
+		return 0, fmt.Errorf("read pack index fanout: %w", e)
 	}
-	if e = sc.Err(); e != nil {
-		return 0, e
-	}
-	if e = c.Wait(); e != nil {
-		return 0, fmt.Errorf("show-index: %w: %s", e, errb.String())
-	}
-	return n, nil
+	return uint64(binary.BigEndian.Uint32(count[:])), nil
 }
 
 // WriteMIDX refreshes the repository's multi-pack index.
 func (g Git) WriteMIDX(ctx context.Context) error {
-	return g.cmd(ctx, "multi-pack-index", "write").Run()
+	_, e := g.Run(ctx, "multi-pack-index", "write")
+	return e
 }
 
 // IsComplete reports whether the repository is non-shallow and has no partial-clone filter.
@@ -288,7 +376,8 @@ func (g Git) IsComplete(ctx context.Context) error {
 			return fmt.Errorf("shallow or partial repository")
 		}
 	}
-	return g.cmd(ctx, "fsck", "--connectivity-only", "--no-dangling").Run()
+	_, e := g.Run(ctx, "fsck", "--connectivity-only", "--no-dangling")
+	return e
 }
 
 // PackDir returns the repository's object pack directory.
@@ -325,7 +414,10 @@ func (g Git) CreatePack(ctx context.Context, dir string, positive, negative []st
 	}
 	_ = in.Close()
 	if e = c.Wait(); e != nil {
-		return "", "", fmt.Errorf("pack-objects: %w: %s", e, errb.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", "", ctxErr
+		}
+		return "", "", errs.E(errs.LocalGitFailed, "git pack-objects", fmt.Errorf("%w: %s", e, errb.String()))
 	}
 	sum := strings.TrimSpace(out.String())
 	return base + "-" + sum + ".pack", base + "-" + sum + ".idx", nil
@@ -353,7 +445,10 @@ func (g Git) MergePacks(ctx context.Context, dir string, packNames []string) (st
 	}
 	_ = in.Close()
 	if e = c.Wait(); e != nil {
-		return "", "", fmt.Errorf("pack-objects --stdin-packs: %w: %s", e, errb.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", "", ctxErr
+		}
+		return "", "", errs.E(errs.LocalGitFailed, "git pack-objects --stdin-packs", fmt.Errorf("%w: %s", e, errb.String()))
 	}
 	sum := strings.TrimSpace(out.String())
 	return base + "-" + sum + ".pack", base + "-" + sum + ".idx", nil

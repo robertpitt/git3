@@ -16,6 +16,7 @@ the AWS SDK.
 | `git3.bucketKeyEnabled` | `git3BucketKeyEnabled` | `GIT3_BUCKET_KEY_ENABLED` | unset |
 | `git3.multipartThreshold` | `git3MultipartThreshold` | `GIT3_MULTIPART_THRESHOLD` | `100MiB` |
 | `git3.partSize` | `git3PartSize` | `GIT3_PART_SIZE` | `128MiB` |
+| `git3.uploadConcurrency` | `git3UploadConcurrency` | `GIT3_UPLOAD_CONCURRENCY` | `2` |
 | `git3.downloadChunkSize` | `git3DownloadChunkSize` | `GIT3_DOWNLOAD_CHUNK_SIZE` | `64MiB` |
 | `git3.downloadConcurrency` | `git3DownloadConcurrency` | `GIT3_DOWNLOAD_CONCURRENCY` | `4` |
 | `git3.maxAttempts` | `git3MaxAttempts` | `GIT3_MAX_ATTEMPTS` | `5` |
@@ -27,6 +28,10 @@ the AWS SDK.
 For a remote named `origin`, combine `remote.origin.` with the named suffix, for example
 `remote.origin.git3DownloadConcurrency`. Boolean values use Git boolean spellings. Byte values are
 unsigned bytes or use `KiB`, `MiB`, `GiB`, or `TiB`.
+
+`uploadConcurrency` bounds in-flight multipart parts from 1 to 16. Multipart upload memory is
+approximately `partSize × uploadConcurrency`, so increase it only when the available memory and
+network bandwidth justify the additional parallelism.
 
 `AWS_PROFILE` selects a profile from the standard AWS shared configuration and credentials files.
 The equivalent Git settings let different remotes use different AWS accounts or roles:

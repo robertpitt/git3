@@ -43,16 +43,20 @@ func (m *Memory) Get(_ context.Context, key, ifNone string) (Object, error) {
 	return Object{Body: append([]byte(nil), e.body...), ETag: e.etag, Size: int64(len(e.body)), LastModified: e.modified}, nil
 }
 
-// GetRange returns the inclusive byte range [start, end].
-func (m *Memory) GetRange(_ context.Context, key string, start, end int64) ([]byte, error) {
-	o, e := m.Get(context.Background(), key, "")
-	if e != nil {
-		return nil, e
+// OpenRange opens the inclusive byte range [start, end].
+func (m *Memory) OpenRange(_ context.Context, key string, start, end int64) (Range, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Requests = append(m.Requests, "RANGE "+key)
+	e, ok := m.objects[key]
+	if !ok {
+		return Range{}, ErrNotFound
 	}
-	if start < 0 || end < start || end >= int64(len(o.Body)) {
-		return nil, fmt.Errorf("invalid range")
+	if start < 0 || end < start || end >= int64(len(e.body)) {
+		return Range{}, fmt.Errorf("invalid range")
 	}
-	return append([]byte(nil), o.Body[start:end+1]...), nil
+	b := append([]byte(nil), e.body[start:end+1]...)
+	return Range{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b)), TotalSize: int64(len(e.body))}, nil
 }
 
 // Head returns metadata for the current object.
@@ -109,10 +113,9 @@ func (m *Memory) Delete(_ context.Context, key string, o DeleteOptions) error {
 	return nil
 }
 
-// List returns object metadata beneath prefix in key order.
-func (m *Memory) List(_ context.Context, prefix string) ([]Metadata, error) {
+// Walk visits object metadata beneath prefix in key order.
+func (m *Memory) Walk(ctx context.Context, prefix string, visit func(Metadata) error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.Requests = append(m.Requests, "LIST "+prefix)
 	var out []Metadata
 	for k, e := range m.objects {
@@ -120,8 +123,17 @@ func (m *Memory) List(_ context.Context, prefix string) ([]Metadata, error) {
 			out = append(out, Metadata{Key: k, ETag: e.etag, Size: int64(len(e.body)), LastModified: e.modified})
 		}
 	}
+	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, nil
+	for _, metadata := range out {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		if e := visit(metadata); e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // Set unconditionally stores an object for test setup.

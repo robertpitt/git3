@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -38,12 +39,16 @@ func TestDefaultsValidate(t *testing.T) {
 
 func TestProfileFromAWSProfile(t *testing.T) {
 	t.Setenv("AWS_PROFILE", "production")
-	c, err := FromEnv()
+	t.Setenv("GIT3_UPLOAD_CONCURRENCY", "5")
+	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Profile != "production" {
 		t.Fatalf("profile = %q", c.Profile)
+	}
+	if c.UploadConcurrency != 5 {
+		t.Fatalf("upload concurrency = %d", c.UploadConcurrency)
 	}
 }
 
@@ -59,6 +64,9 @@ func TestNamedRemoteProfile(t *testing.T) {
 	if out, err := exec.Command("git", "-C", dir, "config", "remote.origin.git3Profile", "account-role").CombinedOutput(); err != nil {
 		t.Fatalf("git config: %v: %s", err, out)
 	}
+	if out, err := exec.Command("git", "-C", dir, "config", "git3.profile", "default-role").CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v: %s", err, out)
+	}
 	old, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -67,11 +75,39 @@ func TestNamedRemoteProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	trace := filepath.Join(bin, "calls")
+	script := "#!/bin/sh\nprintf x >> \"$GIT3_TEST_TRACE\"\nexec \"$GIT3_TEST_GIT\" \"$@\"\n"
+	if err = os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT3_TEST_TRACE", trace)
+	t.Setenv("GIT3_TEST_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	c, err := Load("origin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Profile != "account-role" {
 		t.Fatalf("profile = %q", c.Profile)
+	}
+	t.Setenv("AWS_PROFILE", "environment-role")
+	c, err = Load("origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Profile != "environment-role" {
+		t.Fatalf("environment profile = %q", c.Profile)
+	}
+	b, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(b), "x"); got != 2 {
+		t.Fatalf("git config subprocesses = %d, want 2", got)
 	}
 }

@@ -22,6 +22,13 @@ type Object struct {
 	LastModified time.Time
 }
 
+// Range is a streamed inclusive byte range and its validated response metadata.
+type Range struct {
+	Body      io.ReadCloser
+	Size      int64
+	TotalSize int64
+}
+
 // Metadata describes an object without its body.
 type Metadata struct {
 	Key, ETag    string
@@ -42,9 +49,9 @@ type DeleteOptions struct{ IfMatch string }
 // Store is the object-storage contract required by the repository engine.
 type Store interface {
 	Get(context.Context, string, string) (Object, error)
-	GetRange(context.Context, string, int64, int64) ([]byte, error)
+	OpenRange(context.Context, string, int64, int64) (Range, error)
 	Head(context.Context, string) (Metadata, error)
 	Put(context.Context, string, io.Reader, int64, PutOptions) (Metadata, error)
 	Delete(context.Context, string, DeleteOptions) error
-	List(context.Context, string) ([]Metadata, error)
+	Walk(context.Context, string, func(Metadata) error) error
 }

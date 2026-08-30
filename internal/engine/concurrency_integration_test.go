@@ -39,33 +39,36 @@ func TestEightPinnedWritersOneCASWinner(t *testing.T) {
 	a := run(t, dir, "rev-parse", "HEAD")
 	mem := store.NewMemory()
 	first := &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test"}
-	if _, e := first.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &a}}, true); e != nil {
+	if _, e := first.Push(ctx, nil, []PushCommand{{Dst: "refs/heads/main", NewOID: &a}}, PushOptions{Atomic: true}); e != nil {
 		t.Fatal(e)
 	}
 	os.WriteFile(filepath.Join(dir, "f"), []byte("b"), 0600)
 	run(t, dir, "commit", "-qam", "b")
 	b := run(t, dir, "rev-parse", "HEAD")
 	writers := make([]*Repository, 8)
+	advertisements := make([]*Advertisement, len(writers))
 	for i := range writers {
 		writers[i] = &Repository{Store: mem, Git: gitx.Git{Dir: dir}, Version: "test"}
-		if _, e := writers[i].Read(ctx); e != nil {
+		var e error
+		advertisements[i], e = writers[i].Advertise(ctx)
+		if e != nil {
 			t.Fatal(e)
 		}
 	}
 	var wg sync.WaitGroup
 	wins := 0
 	var mu sync.Mutex
-	for _, w := range writers {
+	for i, w := range writers {
 		wg.Add(1)
-		go func(w *Repository) {
+		go func(w *Repository, advertised *Advertisement) {
 			defer wg.Done()
-			_, e := w.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &b}}, true)
+			_, e := w.Push(ctx, advertised, []PushCommand{{Dst: "refs/heads/main", NewOID: &b}}, PushOptions{Atomic: true})
 			if e == nil {
 				mu.Lock()
 				wins++
 				mu.Unlock()
 			}
-		}(w)
+		}(w, advertisements[i])
 	}
 	wg.Wait()
 	if wins != 1 {
@@ -92,26 +95,37 @@ func TestLostPublishResponseIsConfirmedFromChain(t *testing.T) {
 	a := run(t, dir, "rev-parse", "HEAD")
 	st := &lostResponseStore{Memory: store.NewMemory()}
 	repo := &Repository{Store: st, Git: gitx.Git{Dir: dir}, Version: "test"}
-	if _, e := repo.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &a}}, true); e != nil {
+	if _, e := repo.Push(ctx, nil, []PushCommand{{Dst: "refs/heads/main", NewOID: &a}}, PushOptions{Atomic: true}); e != nil {
 		t.Fatal(e)
 	}
 	os.WriteFile(filepath.Join(dir, "f"), []byte("b"), 0600)
 	run(t, dir, "commit", "-qam", "b")
 	b := run(t, dir, "rev-parse", "HEAD")
-	repo.Pinned = nil
-	if _, e := repo.Read(ctx); e != nil {
+	advertised, e := repo.Advertise(ctx)
+	if e != nil {
 		t.Fatal(e)
 	}
 	st.lose = true
-	if res, e := repo.Push(ctx, []PushCommand{{Dst: "refs/heads/main", NewOID: &b}}, true); e != nil || !res[0].OK {
+	if res, e := repo.Push(ctx, advertised, []PushCommand{{Dst: "refs/heads/main", NewOID: &b}}, PushOptions{Atomic: true}); e != nil || !res[0].OK {
 		t.Fatalf("publication was not confirmed: %#v %v", res, e)
 	}
-	repo.Pinned = nil
 	s, e := repo.Read(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
 	if s.Refs["refs/heads/main"] != b || s.Head.LogicalGeneration != 2 {
 		t.Fatal("published state missing")
+	}
+	st.lose = true
+	publicationID, e := repo.SetHead(ctx, "refs/heads/main")
+	if e != nil {
+		t.Fatalf("set-head publication was not confirmed: %v", e)
+	}
+	s, e = repo.Read(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if s.Head.PublicationID != publicationID {
+		t.Fatal("confirmed set-head publication is missing")
 	}
 }

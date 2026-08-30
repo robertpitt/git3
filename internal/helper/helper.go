@@ -13,16 +13,24 @@ import (
 )
 
 // Helper implements Git's remote-helper protocol for a Repository.
+type Remote interface {
+	Advertise(context.Context) (*engine.Advertisement, error)
+	Fetch(context.Context, *engine.Advertisement, []string, engine.FetchOptions) (engine.FetchReport, error)
+	Push(context.Context, *engine.Advertisement, []engine.PushCommand, engine.PushOptions) ([]engine.PushResult, error)
+}
+
 type Helper struct {
-	Repo                 *engine.Repository
+	Repo                 Remote
 	In                   io.Reader
 	Out, Err             io.Writer
+	advertisement        *engine.Advertisement
 	atomic, connectivity bool
 	progress             bool
 	verbosity            int
 	dryRun               bool
 	wantObjectFormat     bool
 	requestedFormat      string
+	progressOutput       *terminalProgress
 }
 
 // Run serves remote-helper commands until standard input closes.
@@ -51,11 +59,7 @@ func (h *Helper) Run(ctx context.Context) error {
 			}
 			w.Flush()
 		case line == "list" || line == "list for-push":
-			s := h.Repo.Pinned
-			var e error
-			if s == nil {
-				s, e = h.Repo.Read(ctx)
-			}
+			s, e := h.advertise(ctx)
 			if e == store.ErrNotFound {
 				fmt.Fprintln(w)
 				w.Flush()
@@ -64,17 +68,18 @@ func (h *Helper) Run(ctx context.Context) error {
 			if e != nil {
 				return e
 			}
-			if h.requestedFormat != "" && h.requestedFormat != s.Head.ObjectFormat {
-				return fmt.Errorf("requested object format %s, remote uses %s", h.requestedFormat, s.Head.ObjectFormat)
+			h.advertisement = s
+			if h.requestedFormat != "" && h.requestedFormat != s.ObjectFormat {
+				return fmt.Errorf("requested object format %s, remote uses %s", h.requestedFormat, s.ObjectFormat)
 			}
 			if h.wantObjectFormat {
-				fmt.Fprintf(w, ":object-format %s\n", s.Head.ObjectFormat)
+				fmt.Fprintf(w, ":object-format %s\n", s.ObjectFormat)
 			}
 			for _, ref := range sorted(s.Refs) {
 				fmt.Fprintf(w, "%s %s\n", s.Refs[ref], ref)
 			}
-			if s.Head.HeadSymref != nil {
-				fmt.Fprintf(w, "@%s HEAD\n", *s.Head.HeadSymref)
+			if s.HeadSymref != nil {
+				fmt.Fprintf(w, "@%s HEAD\n", *s.HeadSymref)
 			}
 			fmt.Fprintln(w)
 			w.Flush()
@@ -97,25 +102,24 @@ func (h *Helper) Run(ctx context.Context) error {
 					return fmt.Errorf("expected fetch command")
 				}
 			}
-			s := h.Repo.Pinned
+			s := h.advertisement
 			if s == nil {
 				var e error
-				s, e = h.Repo.Read(ctx)
+				s, e = h.advertise(ctx)
 				if e != nil {
 					return e
 				}
 			}
-			if e := h.Repo.Fetch(ctx, s, req, h.connectivity); e != nil {
+			report, e := h.Repo.Fetch(ctx, s, req, engine.FetchOptions{Progress: h.progressSink()})
+			if e != nil {
 				return e
 			}
-			for _, msg := range h.Repo.Warnings {
+			for _, msg := range report.Warnings {
 				fmt.Fprintln(h.Err, "warning:", msg)
 			}
-			h.Repo.Warnings = nil
-			for _, p := range h.Repo.InstalledKeeps {
+			for _, p := range report.InstalledKeeps {
 				fmt.Fprintf(w, "lock %s\n", p)
 			}
-			h.Repo.InstalledKeeps = nil
 			if h.connectivity {
 				fmt.Fprintln(w, "connectivity-ok")
 			}
@@ -144,17 +148,9 @@ func (h *Helper) Run(ctx context.Context) error {
 				if len(p) != 2 {
 					return fmt.Errorf("invalid push refspec")
 				}
-				var oid *string
-				if p[0] != "" {
-					v, e := h.Repo.Git.Resolve(ctx, p[0])
-					if e != nil {
-						v = p[0]
-					}
-					oid = &v
-				}
-				cmds = append(cmds, engine.PushCommand{Source: p[0], Dst: p[1], NewOID: oid, Force: force})
+				cmds = append(cmds, engine.PushCommand{Source: p[0], Dst: p[1], Force: force})
 			}
-			res, e := h.Repo.Push(ctx, cmds, h.atomic)
+			res, e := h.Repo.Push(ctx, h.advertisement, cmds, engine.PushOptions{Atomic: h.atomic, DryRun: h.dryRun, Progress: h.progressSink()})
 			if e != nil {
 				for _, c := range cmds {
 					fmt.Fprintf(w, "error %s %s\n", c.Dst, sanitize(e.Error()))
@@ -178,6 +174,35 @@ func (h *Helper) Run(ctx context.Context) error {
 	}
 	return sc.Err()
 }
+
+func (h *Helper) progressSink() engine.ProgressSink {
+	if !h.progress && h.verbosity < 2 {
+		return nil
+	}
+	if h.progressOutput == nil {
+		h.progressOutput = &terminalProgress{out: h.Err}
+	}
+	return h.progressOutput
+}
+
+func (h *Helper) advertise(ctx context.Context) (*engine.Advertisement, error) {
+	if h.advertisement != nil {
+		return h.advertisement, nil
+	}
+	progress := h.progressSink()
+	if progress != nil {
+		progress.Update(engine.ProgressEvent{Phase: "Resolving S3 repository state"})
+	}
+	s, err := h.Repo.Advertise(ctx)
+	if progress != nil && (err == nil || err == store.ErrNotFound) {
+		progress.Update(engine.ProgressEvent{Phase: "Resolving S3 repository state", Done: true})
+	}
+	if err == nil {
+		h.advertisement = s
+	}
+	return s, err
+}
+
 func (h *Helper) option(name, value string) string {
 	parseBoolean := func() (bool, bool) {
 		v, err := strconv.ParseBool(value)
@@ -224,7 +249,6 @@ func (h *Helper) option(name, value string) string {
 			return "error invalid boolean"
 		}
 		h.dryRun = v
-		h.Repo.DryRun = v
 		return "ok"
 	case "object-format":
 		if value == "true" {

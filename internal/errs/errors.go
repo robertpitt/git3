@@ -1,6 +1,7 @@
 package errs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -48,6 +49,15 @@ func E(code Code, op string, err error) error {
 	return &Error{Code: code, Op: op, Err: err}
 }
 
+// WithDefault classifies err only when a deeper layer has not already done so.
+func WithDefault(code Code, op string, err error) error {
+	var classified *Error
+	if errors.As(err, &classified) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return E(code, op, err)
+}
+
 // ExitCode maps a stable failure code to its command exit status.
 func ExitCode(code Code) int {
 	switch code {
@@ -75,6 +85,9 @@ func CodeOf(err error) Code {
 	var e *Error
 	if errors.As(err, &e) {
 		return e.Code
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return Cancelled
 	}
 	s := strings.ToLower(err.Error())
 	switch {

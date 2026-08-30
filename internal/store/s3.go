@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/robertpitt/git3/internal/config"
+	"github.com/robertpitt/git3/internal/errs"
 	"github.com/robertpitt/git3/internal/locator"
 )
 
@@ -87,9 +90,11 @@ func mapS3(err error) error {
 		case "PreconditionFailed", "412", "ConditionalRequestConflict", "409":
 			return ErrPrecondition
 		case "AccessDenied", "InvalidAccessKeyId", "ExpiredToken":
-			return fmt.Errorf("authorization: %w", err)
+			return errs.E(errs.AuthFailed, "s3", err)
 		case "NoSuchBucket":
-			return fmt.Errorf("bucket not found: %w", err)
+			return errs.E(errs.BucketNotFound, "s3", err)
+		case "RequestTimeout", "SlowDown", "ServiceUnavailable", "InternalError":
+			return errs.E(errs.NetworkExhausted, "s3", err)
 		}
 	}
 	var hs interface{ HTTPStatusCode() int }
@@ -102,7 +107,9 @@ func mapS3(err error) error {
 		case 409, 412:
 			return ErrPrecondition
 		case 401, 403:
-			return fmt.Errorf("authorization: %w", err)
+			return errs.E(errs.AuthFailed, "s3", err)
+		case 408, 429, 500, 502, 503, 504:
+			return errs.E(errs.NetworkExhausted, "s3", err)
 		}
 	}
 	return err
@@ -149,22 +156,43 @@ func getLimit(key string) int64 {
 	}
 }
 
-// GetRange returns the inclusive byte range [start, end].
-func (s *S3) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
+// OpenRange opens the inclusive byte range [start, end].
+func (s *S3) OpenRange(ctx context.Context, key string, start, end int64) (Range, error) {
+	if start < 0 || end < start {
+		return Range{}, fmt.Errorf("invalid range")
+	}
 	out, e := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(s.key(key)), Range: aws.String(fmt.Sprintf("bytes=%d-%d", start, end))})
 	if e != nil {
-		return nil, mapS3(e)
+		return Range{}, mapS3(e)
 	}
-	defer out.Body.Close()
 	want := end - start + 1
-	b, e := io.ReadAll(io.LimitReader(out.Body, want+1))
-	if e != nil {
-		return nil, e
+	a, b, total, e := parseContentRange(aws.ToString(out.ContentRange))
+	if e != nil || a != start || b != end || total <= end || out.ContentLength == nil || *out.ContentLength != want {
+		_ = out.Body.Close()
+		return Range{}, fmt.Errorf("invalid range response metadata")
 	}
-	if int64(len(b)) > want {
-		return nil, fmt.Errorf("range response too large")
+	return Range{Body: out.Body, Size: want, TotalSize: total}, nil
+}
+
+func parseContentRange(v string) (int64, int64, int64, error) {
+	if !strings.HasPrefix(v, "bytes ") {
+		return 0, 0, 0, fmt.Errorf("invalid content range")
 	}
-	return b, nil
+	span, totalText, ok := strings.Cut(strings.TrimPrefix(v, "bytes "), "/")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("invalid content range")
+	}
+	startText, endText, ok := strings.Cut(span, "-")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("invalid content range")
+	}
+	start, e1 := strconv.ParseInt(startText, 10, 64)
+	end, e2 := strconv.ParseInt(endText, 10, 64)
+	total, e3 := strconv.ParseInt(totalText, 10, 64)
+	if e1 != nil || e2 != nil || e3 != nil || start < 0 || end < start || total <= end {
+		return 0, 0, 0, fmt.Errorf("invalid content range")
+	}
+	return start, end, total, nil
 }
 
 // Head returns metadata for the current object.
@@ -188,7 +216,7 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, o Put
 		}
 		return s.putMultipart(ctx, key, io.MultiReader(bytes.NewReader(prefix), r), o)
 	}
-	if size >= s.cfg.MultipartThreshold && o.IfMatch == "" {
+	if size > 0 && size >= s.cfg.MultipartThreshold && o.IfMatch == "" {
 		return s.putMultipart(ctx, key, r, o)
 	}
 	return s.putSingle(ctx, key, r, size, o)
@@ -250,31 +278,105 @@ func (s *S3) putMultipart(ctx context.Context, key string, r io.Reader, o PutOpt
 	if s.cfg.PartSize > int64(^uint(0)>>1) {
 		return Metadata{}, fmt.Errorf("part size exceeds platform limit")
 	}
-	buf := make([]byte, int(s.cfg.PartSize))
+	workers := s.cfg.UploadConcurrency
+	if workers < 1 {
+		workers = 2
+	}
+	type uploadResult struct {
+		part   types.CompletedPart
+		buffer []byte
+		size   int64
+		err    error
+	}
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan uploadResult, workers)
+	free := make([][]byte, workers)
 	var parts []types.CompletedPart
 	var total int64
-	for nPart := int32(1); ; nPart++ {
+	var inflight int
+	accept := func(result uploadResult) error {
+		inflight--
+		free = append(free, result.buffer[:cap(result.buffer)])
+		if result.err != nil {
+			return result.err
+		}
+		parts = append(parts, result.part)
+		total += result.size
+		return nil
+	}
+	drain := func() {
+		for inflight > 0 {
+			_ = accept(<-results)
+		}
+	}
+	nPart := int32(1)
+	doneReading := false
+	for !doneReading {
+		if len(free) == 0 {
+			if e = accept(<-results); e != nil {
+				cancel()
+				drain()
+				return Metadata{}, e
+			}
+		}
+		last := len(free) - 1
+		buf := free[last]
+		free = free[:last]
+		if buf == nil {
+			buf = make([]byte, int(s.cfg.PartSize))
+		}
 		n, er := io.ReadFull(r, buf)
 		if er == io.EOF && n == 0 {
+			free = append(free, buf)
 			break
 		}
 		if er != nil && er != io.ErrUnexpectedEOF {
+			cancel()
+			drain()
 			return Metadata{}, er
 		}
-		body := bytes.NewReader(buf[:n])
-		up, e := s.client.UploadPart(ctx, &s3.UploadPartInput{Bucket: &s.bucket, Key: aws.String(s.key(key)), UploadId: started.UploadId, PartNumber: aws.Int32(nPart), Body: body, ContentLength: aws.Int64(int64(n)), ChecksumAlgorithm: types.ChecksumAlgorithmSha256})
-		if e != nil {
-			return Metadata{}, mapS3(e)
-		}
-		parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(nPart), ChecksumSHA256: up.ChecksumSHA256})
-		total += int64(n)
-		if er == io.ErrUnexpectedEOF {
-			break
-		}
-		if nPart >= 10000 {
+		if nPart > 10000 {
+			cancel()
+			drain()
 			return Metadata{}, fmt.Errorf("multipart upload exceeds 10,000 parts")
 		}
+		partNumber := nPart
+		inflight++
+		go func(buffer []byte, size int, partNumber int32) {
+			up, uploadErr := s.client.UploadPart(uploadCtx, &s3.UploadPartInput{Bucket: &s.bucket, Key: aws.String(s.key(key)), UploadId: started.UploadId, PartNumber: aws.Int32(partNumber), Body: bytes.NewReader(buffer[:size]), ContentLength: aws.Int64(int64(size)), ChecksumAlgorithm: types.ChecksumAlgorithmSha256})
+			result := uploadResult{buffer: buffer, size: int64(size), err: mapS3(uploadErr)}
+			if uploadErr == nil {
+				result.part = types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(partNumber), ChecksumSHA256: up.ChecksumSHA256}
+			}
+			results <- result
+		}(buf, n, partNumber)
+		nPart++
+		if er == io.ErrUnexpectedEOF {
+			doneReading = true
+		}
+	ready:
+		for inflight > 0 {
+			select {
+			case result := <-results:
+				if e = accept(result); e != nil {
+					cancel()
+					drain()
+					return Metadata{}, e
+				}
+			default:
+				break ready
+			}
+		}
 	}
+	for inflight > 0 {
+		if e = accept(<-results); e != nil {
+			cancel()
+			drain()
+			return Metadata{}, e
+		}
+	}
+	sort.Slice(parts, func(i, j int) bool { return aws.ToInt32(parts[i].PartNumber) < aws.ToInt32(parts[j].PartNumber) })
 	complete := &s3.CompleteMultipartUploadInput{Bucket: &s.bucket, Key: aws.String(s.key(key)), UploadId: started.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}}
 	if o.IfMatch != "" {
 		complete.IfMatch = aws.String(o.IfMatch)
@@ -317,14 +419,13 @@ func (s *S3) Delete(ctx context.Context, key string, o DeleteOptions) error {
 	return mapS3(e)
 }
 
-// List returns object metadata beneath prefix in key order.
-func (s *S3) List(ctx context.Context, prefix string) ([]Metadata, error) {
-	var out []Metadata
+// Walk visits object metadata beneath prefix in key order, one S3 page at a time.
+func (s *S3) Walk(ctx context.Context, prefix string, visit func(Metadata) error) error {
 	var token *string
 	for {
 		r, e := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: aws.String(s.key(prefix)), ContinuationToken: token})
 		if e != nil {
-			return nil, mapS3(e)
+			return mapS3(e)
 		}
 		for _, x := range r.Contents {
 			k := aws.ToString(x.Key)
@@ -332,12 +433,20 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Metadata, error) {
 			if base != "" {
 				k = strings.TrimPrefix(k, base+"/")
 			}
-			out = append(out, Metadata{Key: k, ETag: aws.ToString(x.ETag), Size: aws.ToInt64(x.Size), LastModified: aws.ToTime(x.LastModified)})
+			if e = visit(Metadata{Key: k, ETag: aws.ToString(x.ETag), Size: aws.ToInt64(x.Size), LastModified: aws.ToTime(x.LastModified)}); e != nil {
+				return e
+			}
 		}
 		if !aws.ToBool(r.IsTruncated) {
 			break
 		}
+		if r.NextContinuationToken == nil || aws.ToString(r.NextContinuationToken) == "" {
+			return fmt.Errorf("truncated object listing omitted continuation token")
+		}
+		if token != nil && aws.ToString(r.NextContinuationToken) == aws.ToString(token) {
+			return fmt.Errorf("truncated object listing repeated continuation token")
+		}
 		token = r.NextContinuationToken
 	}
-	return out, nil
+	return nil
 }

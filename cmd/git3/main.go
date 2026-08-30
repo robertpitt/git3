@@ -69,7 +69,7 @@ func repository(ctx context.Context, target string) (*engine.Repository, error) 
 	}
 	l, e := locator.Parse(raw)
 	if e != nil {
-		return nil, e
+		return nil, errs.E(errs.ConfigInvalid, "remote URL", e)
 	}
 	remoteName := ""
 	if !strings.HasPrefix(target, "s3://") {
@@ -77,7 +77,7 @@ func repository(ctx context.Context, target string) (*engine.Repository, error) 
 	}
 	c, e := config.Load(remoteName)
 	if e != nil {
-		return nil, e
+		return nil, errs.E(errs.ConfigInvalid, "configuration", e)
 	}
 	resolvedLogFormat = c.LogFormat
 	s, e := store.NewS3(ctx, l, c)
@@ -160,20 +160,20 @@ func command(ctx context.Context) *cobra.Command {
 		}
 		if s, se := r.Read(ctx); se == nil {
 			fmt.Fprintf(os.Stderr, "maintenance: repositoryId=%s generation=%d floor=%d\n", s.Head.RepositoryID, s.Head.LogicalGeneration, s.Head.Packset.Generation)
-			r.Pinned = nil
 		}
 		fanout := r.CompactionFanout
 		if fanout < 2 {
 			fanout = 4
 		}
+		var maxBytesValue int64
 		if maxBytes != "" && !all {
 			n, e := config.ParseBytes(maxBytes)
 			if e != nil {
-				return e
+				return errs.E(errs.ConfigInvalid, "--max-bytes", e)
 			}
-			r.MaintenanceMaxBytes = n
+			maxBytesValue = n
 		}
-		id, e := r.Maintenance(ctx, fanout)
+		id, e := r.Maintenance(ctx, engine.MaintenanceOptions{Fanout: fanout, MaxBytes: maxBytesValue})
 		if e == nil {
 			fmt.Printf("publicationId=%s\n", id)
 		}
@@ -207,11 +207,11 @@ func command(ctx context.Context) *cobra.Command {
 		if older != "" {
 			cut, e = parseCutoff(older)
 			if e != nil {
-				return e
+				return errs.E(errs.ConfigInvalid, "--older-than", e)
 			}
 		}
 		if execute && older == "" {
-			return fmt.Errorf("--execute requires --older-than")
+			return errs.E(errs.ConfigInvalid, "gc", fmt.Errorf("--execute requires --older-than"))
 		}
 		if execute {
 			preview, pe := r.GCDryRun(ctx, cut)

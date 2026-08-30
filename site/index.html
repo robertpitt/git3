@@ -430,7 +430,7 @@
               <tr>
                 <th class="px-5 py-3.5 font-semibold" scope="col">Git action</th>
                 <th class="px-3 py-3.5 text-center font-semibold" scope="col">GET</th>
-                <th class="px-3 py-3.5 text-center font-semibold" scope="col">HEAD</th>
+                <th class="px-3 py-3.5 text-center font-semibold" scope="col">HEAD API</th>
                 <th class="px-3 py-3.5 text-center font-semibold" scope="col">PUT</th>
                 <th class="px-3 py-3.5 text-center font-semibold" scope="col">LIST</th>
                 <th class="px-3 py-3.5 text-center font-semibold" scope="col">DELETE</th>
@@ -458,7 +458,7 @@
               </tr>
               <tr>
                 <th class="whitespace-nowrap px-5 py-4 font-semibold text-slate-900" scope="row">Push one updated ref</th>
-                <td class="px-3 py-4 text-center font-mono text-indigo-700">2</td>
+                <td class="px-3 py-4 text-center font-mono text-indigo-700">2–3</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
                 <td class="px-3 py-4 text-center font-mono text-indigo-700">3</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
@@ -467,7 +467,7 @@
               </tr>
               <tr>
                 <th class="whitespace-nowrap px-5 py-4 font-semibold text-slate-900" scope="row">Delete a branch / tag</th>
-                <td class="px-3 py-4 text-center font-mono text-indigo-700">2</td>
+                <td class="px-3 py-4 text-center font-mono text-indigo-700">2–3</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
                 <td class="px-3 py-4 text-center font-mono text-indigo-700">2</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
@@ -477,11 +477,11 @@
               <tr>
                 <th class="whitespace-nowrap px-5 py-4 font-semibold text-slate-900" scope="row">Cold clone, one compacted pack</th>
                 <td class="px-3 py-4 text-center font-mono text-indigo-700">5+</td>
-                <td class="px-3 py-4 text-center font-mono text-indigo-700">2</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
                 <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
-                <td class="px-5 py-4 text-slate-600">HEAD, refs, packset, then metadata and range reads for pack + index.</td>
+                <td class="px-3 py-4 text-center font-mono text-slate-400">0</td>
+                <td class="px-5 py-4 text-slate-600">HEAD, refs, packset, then validated range reads for pack + index.</td>
               </tr>
             </tbody>
           </table>
@@ -489,7 +489,7 @@
 
         <div class="mt-5 grid gap-4 text-xs leading-5 text-slate-500 lg:grid-cols-[1.2fr_0.8fr]">
           <p>
-            Typical steady-state traces with no retries, one new transaction, an embedded log tail, and default 64 MiB download ranges. Additional transactions, log pages, large ranges, and multipart uploads add requests proportionally.
+            Typical steady-state traces with no retries, one new transaction, an embedded log tail, and default 64 MiB download ranges. A cache-hit push adds one safety GET; compacted clones validate manifest-sized range responses without separate HeadObject requests. Additional transactions, log pages, large ranges, and multipart uploads add requests proportionally.
           </p>
           <p class="lg:text-right">
             At the S3 request rates used in the benchmark, 10,000 no-op fetches cost about <strong class="font-semibold text-slate-700">$0.0042</strong>; 10,000 typical small pushes about <strong class="font-semibold text-slate-700">$0.167</strong> in request charges.

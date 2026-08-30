@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/robertpitt/git3/internal/config"
+	"github.com/robertpitt/git3/internal/errs"
 	"github.com/robertpitt/git3/internal/locator"
 )
 
@@ -150,11 +152,16 @@ func TestS3GetAndRangeBuildRequests(t *testing.T) {
 		if aws.ToString(in.Range) != "bytes=2-4" {
 			t.Fatalf("range = %q", aws.ToString(in.Range))
 		}
-		return &s3.GetObjectOutput{Body: io.NopCloser(strings.NewReader("234"))}, nil
+		return &s3.GetObjectOutput{Body: io.NopCloser(strings.NewReader("234")), ContentLength: aws.Int64(3), ContentRange: aws.String("bytes 2-4/10")}, nil
 	}
-	part, err := store.GetRange(context.Background(), ".git/git3/wal/id.pack", 2, 4)
-	if err != nil || string(part) != "234" {
-		t.Fatalf("range = %q, %v", part, err)
+	part, err := store.OpenRange(context.Background(), ".git/git3/wal/id.pack", 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partBody, err := io.ReadAll(part.Body)
+	_ = part.Body.Close()
+	if err != nil || string(partBody) != "234" || part.Size != 3 || part.TotalSize != 10 {
+		t.Fatalf("range = %q size=%d total=%d, %v", partBody, part.Size, part.TotalSize, err)
 	}
 }
 
@@ -200,6 +207,8 @@ func TestS3MultipartCompletesAndAbortsOnFailure(t *testing.T) {
 	var uploaded [][]byte
 	completed := false
 	aborted := false
+	var mu sync.Mutex
+	active, maxActive := 0, 0
 	mock := &mockS3API{}
 	mock.createMultipartUpload = func(in *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error) {
 		if aws.ToString(in.Key) != "repo/.git/git3/wal/id.pack" {
@@ -208,11 +217,21 @@ func TestS3MultipartCompletesAndAbortsOnFailure(t *testing.T) {
 		return &s3.CreateMultipartUploadOutput{UploadId: aws.String("upload")}, nil
 	}
 	mock.uploadPart = func(in *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+		mu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
 		body, err := io.ReadAll(in.Body)
 		if err != nil {
 			t.Fatal(err)
 		}
+		mu.Lock()
 		uploaded = append(uploaded, body)
+		active--
+		mu.Unlock()
 		part := aws.ToInt32(in.PartNumber)
 		return &s3.UploadPartOutput{ETag: aws.String("part"), ChecksumSHA256: aws.String("sum" + string(rune('0'+part)))}, nil
 	}
@@ -231,8 +250,8 @@ func TestS3MultipartCompletesAndAbortsOnFailure(t *testing.T) {
 	store.cfg.MultipartThreshold = 4
 	store.cfg.PartSize = 5
 	metadata, err := store.Put(context.Background(), ".git/git3/wal/id.pack", strings.NewReader("abcdefghijkl"), 12, PutOptions{IfNoneMatch: true})
-	if err != nil || metadata.Size != 12 || !completed || aborted || len(uploaded) != 3 {
-		t.Fatalf("metadata=%#v uploaded=%q completed=%t aborted=%t err=%v", metadata, uploaded, completed, aborted, err)
+	if err != nil || metadata.Size != 12 || !completed || aborted || len(uploaded) != 3 || maxActive != 2 {
+		t.Fatalf("metadata=%#v uploaded=%q maxActive=%d completed=%t aborted=%t err=%v", metadata, uploaded, maxActive, completed, aborted, err)
 	}
 
 	mock.uploadPart = func(*s3.UploadPartInput) (*s3.UploadPartOutput, error) { return nil, errors.New("upload failed") }
@@ -275,15 +294,31 @@ func TestS3HeadDeleteListAndErrorMapping(t *testing.T) {
 	if err = store.Delete(context.Background(), ".git/git3/value", DeleteOptions{IfMatch: "delete-etag"}); err != nil {
 		t.Fatal(err)
 	}
-	objects, err := store.List(context.Background(), ".git/git3/")
+	var objects []Metadata
+	err = store.Walk(context.Background(), ".git/git3/", func(metadata Metadata) error {
+		objects = append(objects, metadata)
+		return nil
+	})
 	if err != nil || len(objects) != 2 || objects[0].Key != ".git/git3/a" || objects[1].Key != ".git/git3/b" {
 		t.Fatalf("list = %#v, %v", objects, err)
+	}
+	stop := errors.New("stop listing")
+	page = 0
+	err = store.Walk(context.Background(), ".git/git3/", func(Metadata) error { return stop })
+	if !errors.Is(err, stop) || page != 1 {
+		t.Fatalf("early walk stop = %v after %d pages", err, page)
 	}
 
 	for code, want := range map[string]error{"NoSuchKey": ErrNotFound, "NotModified": ErrNotModified, "PreconditionFailed": ErrPrecondition} {
 		err = mapS3(&smithy.GenericAPIError{Code: code, Message: "test"})
 		if !errors.Is(err, want) {
 			t.Errorf("mapS3(%s) = %v", code, err)
+		}
+	}
+	for code, want := range map[string]errs.Code{"AccessDenied": errs.AuthFailed, "NoSuchBucket": errs.BucketNotFound, "SlowDown": errs.NetworkExhausted} {
+		err = mapS3(&smithy.GenericAPIError{Code: code, Message: "test"})
+		if got := errs.CodeOf(err); got != want {
+			t.Errorf("mapS3(%s) code = %s, want %s", code, got, want)
 		}
 	}
 }
