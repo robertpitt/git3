@@ -7,23 +7,43 @@ control. It works with Amazon S3 and S3-compatible object storage.
 
 ![Git exchanging objects directly with an S3-compatible bucket](assets/git3-s3-flow.png)
 
-## It really is this simple
-
-Bring an existing bucket. AWS credentials and region come from the standard AWS SDK chain.
+## Install in one line
 
 ```sh
-git remote add origin s3://my-bucket/repos/example
-git push -u origin HEAD:refs/heads/main
+curl -fsSL https://github.com/robertpitt/git3/releases/latest/download/install.sh | sh
 ```
 
-Then, from anywhere with Git, git3, and access to the bucket:
+git3 requires Git 2.38 or newer. Releases are available for Linux and macOS on amd64 and arm64.
+
+## Clone
+
+git3 uses the standard AWS SDK credential chain. With credentials already configured:
 
 ```sh
 git clone s3://my-bucket/repos/example
 ```
 
-The first branch push creates the repository inside the bucket prefix. The bucket itself must
-already exist.
+With a named AWS profile:
+
+```sh
+AWS_PROFILE=development git clone s3://my-bucket/repos/example
+```
+
+Or with credentials supplied as environment variables:
+
+```sh
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=us-east-1 git clone s3://my-bucket/repos/example
+```
+
+## Create a remote
+
+Bring an existing bucket, then push a branch. The first branch push creates the repository inside
+the bucket prefix; the bucket itself must already exist.
+
+```sh
+git remote add origin s3://my-bucket/repos/example
+git push -u origin HEAD:refs/heads/main
+```
 
 ## Supported Git commands
 
@@ -52,23 +72,6 @@ local commands such as `log`, `checkout`, `fsck`, and `repack` still work.
 
 git3 is storage and synchronization, not a forge. Anyone who can overwrite the reserved S3 prefix
 is a repository administrator.
-
-## Install
-
-git3 requires Git 2.38 or newer. Releases are available for Linux and macOS on amd64 and arm64.
-
-```sh
-curl -fsSL https://github.com/robertpitt/git3/releases/latest/download/install.sh | sh
-```
-
-Or build from source:
-
-```sh
-go build ./cmd/git3
-```
-
-Install the binary as `git3`, then create `git-s3` and `git-remote-s3` symlinks beside it. For
-versioned archives, checksums, Sigstore bundles, and build provenance, see the GitHub release page.
 
 S3-compatible services can be selected with `GIT3_ENDPOINT`; use `GIT3_PATH_STYLE=true` when the
 service requires path-style addressing. Credentials, regions, endpoints, and encryption settings do
@@ -108,5 +111,16 @@ go test ./...
 go test -race ./...
 go vet ./...
 ```
+
+## Build from source
+
+```sh
+go build -o git3 ./cmd/git3
+ln -s git3 git-s3
+ln -s git3 git-remote-s3
+```
+
+Keep all three files together on your `PATH`. For versioned archives, checksums, Sigstore bundles,
+and build provenance, see the GitHub release page.
 
 Licensed under Apache-2.0.
