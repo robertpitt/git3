@@ -20,6 +20,7 @@ import (
 	"github.com/robertpitt/git3/internal/errs"
 	gitx "github.com/robertpitt/git3/internal/git"
 	"github.com/robertpitt/git3/internal/helper"
+	"github.com/robertpitt/git3/internal/lfs"
 	"github.com/robertpitt/git3/internal/locator"
 	"github.com/robertpitt/git3/internal/model"
 	"github.com/robertpitt/git3/internal/store"
@@ -40,7 +41,7 @@ func main() {
 		if len(os.Args) != 3 {
 			fatal(fmt.Errorf("usage: git-remote-s3 <name> <s3-url>"))
 		}
-		r, e := repository(ctx, os.Args[2])
+		r, e := repositoryAt(ctx, os.Args[1], os.Args[2])
 		if e != nil {
 			fatal(e)
 		}
@@ -59,21 +60,47 @@ func main() {
 }
 func repository(ctx context.Context, target string) (*engine.Repository, error) {
 	g := gitx.Git{}
-	raw := target
-	if !strings.HasPrefix(target, "s3://") {
-		b, e := g.Run(ctx, "config", "--get", "remote."+target+".url")
-		if e != nil {
-			return nil, fmt.Errorf("resolve remote %s: %w", target, e)
-		}
-		raw = strings.TrimSpace(string(b))
-	}
-	l, e := locator.Parse(raw)
+	remoteName, raw, e := resolveTarget(ctx, g, target, "")
 	if e != nil {
 		return nil, errs.E(errs.ConfigInvalid, "remote URL", e)
 	}
-	remoteName := ""
-	if !strings.HasPrefix(target, "s3://") {
-		remoteName = target
+	return repositoryWithGit(ctx, g, remoteName, raw)
+}
+
+func repositoryAt(ctx context.Context, remoteName, raw string) (*engine.Repository, error) {
+	return repositoryWithGit(ctx, gitx.Git{}, remoteName, raw)
+}
+
+func repositoryForLFS(ctx context.Context, operation, target string) (*engine.Repository, error) {
+	g := gitx.Git{}
+	remoteName, raw, e := resolveTarget(ctx, g, target, operation)
+	if e != nil {
+		return nil, e
+	}
+	return repositoryWithGit(ctx, g, remoteName, raw)
+}
+
+func resolveTarget(ctx context.Context, g gitx.Git, target, operation string) (string, string, error) {
+	if strings.HasPrefix(target, "s3://") {
+		return "", target, nil
+	}
+	key := "remote." + target + ".url"
+	if operation == "upload" {
+		if b, e := g.Run(ctx, "config", "--get", "remote."+target+".pushurl"); e == nil && len(strings.TrimSpace(string(b))) > 0 {
+			return target, strings.TrimSpace(string(b)), nil
+		}
+	}
+	b, e := g.Run(ctx, "config", "--get", key)
+	if e != nil {
+		return "", "", fmt.Errorf("resolve remote %s: %w", target, e)
+	}
+	return target, strings.TrimSpace(string(b)), nil
+}
+
+func repositoryWithGit(ctx context.Context, g gitx.Git, remoteName, raw string) (*engine.Repository, error) {
+	l, e := locator.Parse(raw)
+	if e != nil {
+		return nil, e
 	}
 	c, e := config.Load(remoteName)
 	if e != nil {
@@ -103,6 +130,35 @@ func command(ctx context.Context) *cobra.Command {
 	root := &cobra.Command{Use: "git3", SilenceUsage: true}
 	root.AddCommand(&cobra.Command{Use: "version", Args: cobra.NoArgs, Run: func(*cobra.Command, []string) {
 		fmt.Printf("git3 %s commit=%s buildTime=%s dirty=%s go=%s\n", version, commit, buildTime, dirty, runtime.Version())
+	}})
+	lfsCommand := &cobra.Command{Use: "lfs", Short: "Configure Git LFS for s3 remotes"}
+	lfsCommand.AddCommand(&cobra.Command{Use: "install", Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
+		executable, e := os.Executable()
+		if e != nil {
+			return e
+		}
+		g := gitx.Git{}
+		if e = lfs.Install(ctx, executable, g.Run); e != nil {
+			return e
+		}
+		fmt.Println("Git LFS configured for s3:// remotes")
+		return nil
+	}})
+	root.AddCommand(lfsCommand)
+	root.AddCommand(&cobra.Command{Use: "lfs-transfer", Hidden: true, Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
+		agent := &lfs.Agent{In: os.Stdin, Out: os.Stdout, Open: func(ctx context.Context, operation, remote string) (lfs.Backend, error) {
+			r, e := repositoryForLFS(ctx, operation, remote)
+			if e != nil {
+				return lfs.Backend{}, e
+			}
+			if operation == "upload" {
+				if e = r.ValidateWritePolicy(ctx); e != nil {
+					return lfs.Backend{}, e
+				}
+			}
+			return lfs.Backend{Store: r.Store, DownloadChunkSize: r.DownloadChunkSize, DownloadConcurrency: r.DownloadConcurrency}, nil
+		}}
+		return agent.Run(ctx)
 	}})
 	var asJSON, writeTest bool
 	doctor := &cobra.Command{Use: "doctor <remote-or-s3-url>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, a []string) error {

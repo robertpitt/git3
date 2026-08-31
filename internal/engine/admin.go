@@ -575,7 +575,7 @@ func (r *Repository) gcDryRun(ctx context.Context, cutoff time.Time) (GCReport, 
 		if x.Size < 0 {
 			return fmt.Errorf("negative object size for %s", x.Key)
 		}
-		if live[x.Key] || x.Key == ".git/git3/HEAD" || strings.HasPrefix(x.Key, ".git/git3/probes/") || !x.LastModified.Before(cutoff) {
+		if live[x.Key] || x.Key == ".git/git3/HEAD" || strings.HasPrefix(x.Key, ".git/git3/probes/") || strings.HasPrefix(x.Key, ".git/git3/lfs/") || !x.LastModified.Before(cutoff) {
 			return nil
 		}
 		if len(rep.Candidates) == model.MaxRefs {
@@ -606,6 +606,9 @@ func (r *Repository) validateGCCandidates(ctx context.Context, s *RemoteState, c
 		return e
 	}
 	for _, candidate := range candidates {
+		if strings.HasPrefix(candidate.Key, ".git/git3/lfs/") {
+			return fmt.Errorf("GC plan contains protected LFS object: %s", candidate.Key)
+		}
 		if live[candidate.Key] {
 			return fmt.Errorf("candidate became live: %s", candidate.Key)
 		}

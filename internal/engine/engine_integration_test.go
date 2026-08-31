@@ -208,8 +208,22 @@ func TestPushFetchAndIncrementalFetch(t *testing.T) {
 	if len(rep.Candidates) == 0 {
 		t.Fatal("expected compacted orphans")
 	}
+	lfsKey := ".git/git3/lfs/objects/aa/bb/" + strings.Repeat("a", 64)
+	mem.Set(lfsKey, []byte("protected LFS payload"))
+	rep, e = writer.GCDryRun(ctx, time.Now().Add(time.Hour))
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, candidate := range rep.Candidates {
+		if candidate.Key == lfsKey {
+			t.Fatal("LFS object was classified as garbage")
+		}
+	}
 	if _, e = writer.GCExecute(ctx, time.Now().Add(time.Hour)); e != nil {
 		t.Fatal(e)
+	}
+	if _, e = mem.Head(ctx, lfsKey); e != nil {
+		t.Fatalf("GC removed protected LFS object: %v", e)
 	}
 	if e = writer.Fsck(ctx, false); e != nil {
 		t.Fatal(e)

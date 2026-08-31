@@ -92,6 +92,7 @@ The complete target implementation MUST:
 13. Ship statically linked release binaries for Linux and macOS on x86-64 and ARM64, with checksums,
     signatures, and build provenance.
 14. Remain usable at a design envelope of 1 TiB of reachable Git data and 100,000 refs.
+15. Optionally transfer standard Git LFS payloads directly through the configured S3 backend.
 
 ### 4.2 Non-goals
 
@@ -101,7 +102,7 @@ The following are explicitly outside the version 1 core contract:
   retention period.
 - Shallow clone, partial clone, promisor-object operation, and serverless random retrieval of an
   individual missing Git object.
-- Integrated Git LFS storage. Users may configure an independent LFS endpoint.
+- Git LFS locking, authoritative LFS reachability, or automatic remote LFS garbage collection.
 - Server-side hooks, protected branches, review rules, merge queues, or policy that purports to be
   authoritative against a principal with direct write access to the reserved S3 prefix.
 - Client-side encryption. Server-side encryption is the version 1 encryption boundary.
@@ -173,6 +174,8 @@ Internal responsibility boundaries are:
    conditional deletion only after revalidation.
 8. **Release system:** Builds, tests, attests, signs, and publishes versioned binaries and installer
    assets from GitHub Actions.
+9. **Git LFS transfer agent:** Maps standard LFS SHA-256 object IDs to immutable S3 objects and
+   implements the standalone custom-transfer protocol without owning pointer discovery or caching.
 
 ### 6.2 External dependencies
 
@@ -180,6 +183,7 @@ Internal responsibility boundaries are:
 - an AWS S3 general purpose bucket;
 - AWS SDK for Go v2 in the reference implementation;
 - standard AWS credential and shared-configuration sources;
+- the optional `git-lfs` executable when Git LFS transfer is enabled;
 - GitHub Actions and GitHub Releases for official project distribution; and
 - `curl` or `wget`, a POSIX shell, and `sha256sum` or `shasum` for the convenience installer.
 
@@ -250,6 +254,7 @@ All managed objects MUST be below `<repository-prefix>/.git/git3/`:
   packs/pack-<git-pack-checksum>.idx
   gc/<plan-id>.json
   probes/<probe-id>
+  lfs/objects/<oid[0:2]>/<oid[2:4]>/<oid>
 ```
 
 `<generation>` MUST be a 20-digit, zero-padded decimal value. UUIDs MUST use lowercase canonical
@@ -697,7 +702,38 @@ operation is unsupported. The helper MUST fail rather than silently perform a fu
 user explicitly requested a storage-reducing mode. `pushcert`, arbitrary `push-option`, and unknown
 options return `unsupported` unless a later specification defines them.
 
-### 11.3 Ref advertisement
+### 11.3 Git LFS custom transfer
+
+Git LFS support uses its standalone custom-transfer protocol; the Git remote helper MUST NOT invoke
+Git LFS hooks or parse pointer blobs. `git3 lfs-transfer` reads line-delimited JSON from stdin and
+reserves stdout for protocol responses. It MUST:
+
+1. accept one `init` event for `upload` or `download`, resolve its remote name or S3 URL, initialize
+   the normal configured S3 store, and reply with an empty JSON object;
+2. accept zero or more matching transfer events, followed by `terminate` with no response;
+3. validate each OID as 64 lowercase hexadecimal characters and each size as an integer from zero
+   through 1 TiB;
+4. map an OID to `.git/git3/lfs/objects/<first-two>/<next-two>/<oid>`;
+5. return object-specific failures in `complete.error` without terminating unrelated transfers;
+6. emit only protocol JSON on stdout and send fatal diagnostics to stderr; and
+7. leave `.gitattributes`, pointer discovery, filters, hooks, and `.git/lfs` cache ownership to Git
+   and Git LFS.
+
+An upload MUST verify the source file's exact size and SHA-256 before conditionally creating the
+immutable S3 object. An existing key is successful only when its size and digest match. A download
+MUST verify S3 metadata, write bounded range responses to a mode-0600 temporary file, verify the
+complete size and SHA-256, and return that path to Git LFS. A failed download MUST remove its
+temporary file.
+
+`git3 lfs install` MUST verify that Git LFS is available, run its normal installation, and register
+the current executable as a URL-scoped, bidirectional standalone transfer agent for S3 remotes. It
+MUST disable lock verification only for that scope and MUST NOT alter transfer selection for
+unrelated HTTP LFS endpoints. When invoked inside a repository, it MUST verify that the installed
+`pre-push` hook is executable and invokes `git lfs pre-push`. Upload resolution prefers
+`remote.<name>.pushurl`; download resolution uses `remote.<name>.url`. Both use the same effective
+git3/AWS/encryption configuration as Git data.
+
+### 11.4 Ref advertisement
 
 For an absent repository, `list` and `list for-push` MUST return an empty list and MUST NOT create S3
 objects. This permits cloning an empty remote locator without initializing it.
@@ -715,7 +751,7 @@ An HTTP 304 response allows use of the cached ref map only when the cached map b
 repository ID, publication ID, and ETag and its local checksum validates. A missing cache after 304
 is an internal error and MUST cause an unconditional reread.
 
-### 11.4 Fetch command
+### 11.5 Fetch command
 
 A batch of `fetch <oid> <ref>` commands MUST make all requested advertised objects and their required
 closure available in the local object database. git3 MAY materialize more than the requested refs;
@@ -726,7 +762,7 @@ current advertised tips pass local object connectivity. When a newly installed p
 a `.keep` file, the helper MUST emit the remote-helper `lock <path>` response where applicable so Git
 owns removal after ref update.
 
-### 11.5 Push command
+### 11.6 Push command
 
 The helper MUST buffer the complete push batch before performing remote writes. Each destination
 receives one `ok <dst>` or `error <dst> <reason>` result as required by Git's protocol. The helper
@@ -1189,6 +1225,10 @@ Historical `previous` page pointers below `floorGeneration` do not mark below-fl
 is a listed immutable object absent from the live mark set, older than the operator cutoff, and not a
 probe or in-progress multipart upload owned by another live process.
 
+Objects below `.git/git3/lfs/` are outside manifest-based reachability and MUST be excluded from
+candidate discovery and deletion. A client resuming an older plan that names such an object MUST
+refuse the plan without deleting it. LFS-aware reachability and deletion are outside this contract.
+
 Dry-run output MUST include repository ID, pinned publication ID and ETag, candidate key, size, ETag,
 last-modified time, category, and total counts/bytes. It MUST make no S3 writes or deletes.
 
@@ -1244,6 +1284,7 @@ The following commands are core:
 
 ```text
 git3 version
+git3 lfs install
 git3 doctor <remote-or-s3-url> [--json] [--write-test]
 git3 fsck <remote-or-s3-url> [--full] [--json]
 git3 maintenance <remote-or-s3-url> [--max-bytes <n>] [--all]
@@ -1810,6 +1851,7 @@ function execute_gc(operator_cutoff):
 | GIT-12 | Signed commits/tags | Object bytes and verification remain valid. |
 | GIT-13 | Explicit shallow or partial request | Clear failure, never silent full clone. |
 | GIT-14 | Remove git3 after fetch | Stock Git fsck, log, checkout, and repack work. |
+| GIT-15 | LFS push followed by clone/checkout and `git lfs pull` | Payload round-trips by OID with standard pointers. |
 
 ### 27.3 Synchronization and concurrency tests
 
@@ -1854,6 +1896,7 @@ properties are:
 | ADM-08 | Candidate becomes live or ETag changes | Deletion aborts. |
 | ADM-09 | GC crashes after partial deletes | Resume/abort preserves current live state. |
 | ADM-10 | Normal clone/fetch/push/maintenance request trace | No `LIST` or delete API. |
+| ADM-11 | LFS object older than GC cutoff | Never reported or deleted as a candidate. |
 
 ### 27.6 Scale qualification
 
@@ -1897,7 +1940,6 @@ The following MAY be specified later but are not implied by format version 1:
 - a coordinator that batches concurrent pushes while preserving repository-wide transaction order;
 - precomputed blob-oriented pack groups for an explicit partial-clone mode;
 - Windows release and installer support;
-- independent Git LFS custom transfer support;
 - a shared local pack cache using standard Git alternates;
 - metrics exporters or an administrative web interface;
 - cross-region read replicas and signed repository-manifest policy; and
@@ -1909,6 +1951,7 @@ invariants.
 ## 30. References
 
 - [Git remote-helper protocol](https://git-scm.com/docs/gitremote-helpers)
+- [Git LFS custom transfers](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md)
 - [Git `pack-objects`](https://git-scm.com/docs/git-pack-objects)
 - [Git `index-pack`](https://git-scm.com/docs/git-index-pack)
 - [Git multi-pack-index design](https://git-scm.com/docs/multi-pack-index)

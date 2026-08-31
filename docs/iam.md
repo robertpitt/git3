@@ -15,6 +15,10 @@ Writer/maintainer object actions:
 {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:AbortMultipartUpload"],"Resource":"arn:aws:s3:::BUCKET/PREFIX/.git/git3/*"}
 ```
 
+The same reader and writer statements cover optional Git LFS objects below
+`PREFIX/.git/git3/lfs/objects/*`; no additional IAM action is required. LFS uploads may use
+multipart transfer and therefore need `s3:AbortMultipartUpload` like large Git pack uploads.
+
 GC operators additionally need object deletion and prefix-scoped listing:
 
 ```json

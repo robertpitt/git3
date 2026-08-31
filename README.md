@@ -60,6 +60,7 @@ git push -u origin HEAD:refs/heads/main
 | `git push --delete` | Delete branches or tags |
 | `git push --force`, `git push --force-with-lease` | Forced updates with S3 compare-and-swap protection |
 | `git push --atomic` | Atomic multi-ref pushes |
+| `git3 lfs install` | Register optional Git LFS upload/download support for S3 remotes |
 | `git submodule` with `s3://` URLs | Requires git3 and permission for the `s3` protocol in the submodule environment |
 
 Signed commits and tags are preserved. Both SHA-1 and SHA-256 repositories are supported.
@@ -74,7 +75,7 @@ local commands such as `log`, `checkout`, `fsck`, and `repack` still work.
 ## What does not
 
 - Shallow or partial clones
-- Built-in Git LFS storage (use a separate LFS endpoint)
+- Git LFS locking or automatic remote LFS garbage collection
 - Server-side hooks, branch protection, reviews, merge queues, or a web UI
 - `git archive --remote`, `upload-pack`, `receive-pack`, or Git wire-protocol server emulation
 - Windows release binaries
@@ -101,6 +102,28 @@ maintenance compacts packs for efficient cold clones without changing repository
 
 Normal clone, fetch, push, and maintenance need no S3 list or delete permission. Garbage collection
 is separate, explicit, resumable, and dry-run by default.
+
+## Git LFS
+
+Install the `git-lfs` executable, then register git3's S3 transfer agent. Run this once to configure
+the user-level transfer settings and run it inside each repository that will push LFS objects so Git
+LFS can install and git3 can verify its `pre-push` hook:
+
+```sh
+git3 lfs install
+git lfs track "*.zip"
+git add .gitattributes
+```
+
+Ordinary `git push`, clone, checkout, and `git lfs pull` then transfer LFS payloads through the same
+S3 remote, credentials, endpoint, multipart, and encryption configuration as git3. Git commits still
+contain standard LFS pointer blobs; immutable payloads are stored below
+`.git/git3/lfs/objects/` in the repository prefix.
+
+`git3 gc` deliberately excludes this LFS namespace. Remote LFS retention and deletion are operator
+policy; git3 does not infer LFS reachability or delete LFS payloads.
+
+## Administration
 
 ```sh
 git s3 doctor origin
