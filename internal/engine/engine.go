@@ -426,6 +426,19 @@ func (r *Repository) ensureWritePolicy(s *RemoteState) error {
 	}
 	return nil
 }
+
+// ValidateWritePolicy checks that writes use the published repository encryption policy.
+// An absent repository has no published policy, so its local policy remains authoritative.
+func (r *Repository) ValidateWritePolicy(ctx context.Context) error {
+	s, err := r.Read(ctx)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return r.ensureWritePolicy(s)
+}
 func (r *Repository) validatePush(ctx context.Context, s *RemoteState, cmds []PushCommand) ([]model.Update, []PushResult) {
 	seen := map[string]bool{}
 	var us []model.Update

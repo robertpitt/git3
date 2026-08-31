@@ -664,7 +664,7 @@ func (r *Repository) GCDryRun(ctx context.Context, cutoff time.Time) (GCReport, 
 		if e := locator.ValidateManagedKey(x.Key); e != nil {
 			return GCReport{}, e
 		}
-		if live[x.Key] || x.Key == ".git/git3/HEAD" || strings.HasPrefix(x.Key, ".git/git3/probes/") || !x.LastModified.Before(cutoff) {
+		if live[x.Key] || x.Key == ".git/git3/HEAD" || strings.HasPrefix(x.Key, ".git/git3/probes/") || strings.HasPrefix(x.Key, ".git/git3/lfs/") || !x.LastModified.Before(cutoff) {
 			continue
 		}
 		c := model.GCCandidate{Key: x.Key, Size: uint64(x.Size), ETag: x.ETag, LastModified: x.LastModified.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z"), Category: gcCategory(x.Key)}
@@ -834,6 +834,9 @@ func (r *Repository) GCResume(ctx context.Context, id string) (string, error) {
 		return "", e
 	}
 	for _, c := range p.Candidates {
+		if strings.HasPrefix(c.Key, ".git/git3/lfs/") {
+			return "", fmt.Errorf("GC plan contains protected LFS object: %s", c.Key)
+		}
 		if live[c.Key] {
 			return "", fmt.Errorf("candidate became live: %s", c.Key)
 		}

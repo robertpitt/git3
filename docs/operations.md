@@ -16,6 +16,12 @@ a plan, publishes a barrier, revalidates every candidate, conditionally deletes 
 barrier. Resume an interrupted plan with `--resume`; use `--abort` to clear its matching barrier.
 Object Lock, legal holds, versioning, and replication may prevent or preserve deletions.
 
+Git LFS payloads below `.git/git3/lfs/` are excluded from git3's manifest-based garbage collector.
+git3 does not currently determine which LFS OIDs remain reachable or delete LFS payloads. Apply a
+separate, explicitly reviewed bucket lifecycle or future LFS-aware collection process if retention
+is required. Do not resume a GC plan produced by an older client if it names an LFS object; current
+clients reject such a plan and allow it to be aborted safely.
+
 ## Disaster recovery
 
 Enable bucket versioning if rollback is required. Restoring an older HEAD can lower the generation

@@ -35,3 +35,31 @@ The equivalent Git settings let different remotes use different AWS accounts or 
 git config remote.origin.git3Profile production
 git config remote.backup.git3Profile disaster-recovery
 ```
+
+## Git LFS transfer configuration
+
+Git LFS is optional and must be installed separately. `git3 lfs install` runs the normal
+`git lfs install` setup, then registers the current git3 executable as the `git3-s3` standalone
+custom transfer agent for S3-derived LFS endpoints. The registration is URL-scoped and does not
+replace the transfer behavior of ordinary HTTP or hosted Git LFS remotes.
+
+Run the command inside repositories that will push LFS objects so the normal Git LFS `pre-push`
+hook is present; git3 verifies that the hook is executable and invokes `git lfs pre-push`. Outside a
+repository, the command configures only the user-level filters and transfer settings. The transfer
+agent resolves the remote name from each Git LFS initialization message. Downloads use
+`remote.<name>.url`; uploads prefer `remote.<name>.pushurl` when present. Named-remote `git3*`
+settings and the ordinary AWS SDK credential chain apply unchanged.
+
+The installed Git configuration uses these keys:
+
+```text
+lfs.customtransfer.git3-s3.path
+lfs.customtransfer.git3-s3.args
+lfs.customtransfer.git3-s3.concurrent
+lfs.customtransfer.git3-s3.direction
+lfs.https://s3/.standalonetransferagent
+lfs.https://s3/.locksverify
+```
+
+Lock verification is disabled only for the S3-scoped endpoint because git3 does not implement the
+Git LFS locking protocol.
